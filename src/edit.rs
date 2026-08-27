@@ -196,6 +196,39 @@ pub fn selection_text(lines: &[String], a: TextPos, b: TextPos) -> String {
     out
 }
 
+/// 더블클릭 선택 범위. `col` 위치를 감싸는 "공백으로 구분된 덩어리"의
+/// [시작, 끝) char 인덱스를 돌려준다.
+///
+/// 경계는 **공백(스페이스/탭 등 `char::is_whitespace`)뿐**이다. 흔한
+/// 에디터가 쓰는 "낱말 문자 vs 구두점" 구분은 쓰지 않는다 — 이 프로그램이
+/// 다루는 것은 주로 CSV/TSV 한 줄이고, 거기서 사람이 잡고 싶은 단위는
+/// `2026-08-27` 이나 `a.b.c` 같은 필드 통째이지 그 조각이 아니다.
+///
+/// 공백 위에서 눌렀다면 그 공백 덩어리를 돌려준다(Windows 표준과 같다 —
+/// 빈 선택으로 무너뜨리지 않는다).
+///
+/// 빈 줄이면 `(0, 0)`.
+pub fn word_range_at(line: &str, col: usize) -> (usize, usize) {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    // 줄 끝에서 눌렀으면 마지막 문자를 기준으로 삼는다. 그러지 않으면
+    // 줄 끝 더블클릭이 늘 빈 선택이 된다.
+    let at = col.min(chars.len() - 1);
+    let ws = chars[at].is_whitespace();
+
+    let mut start = at;
+    while start > 0 && chars[start - 1].is_whitespace() == ws {
+        start -= 1;
+    }
+    let mut end = at + 1;
+    while end < chars.len() && chars[end].is_whitespace() == ws {
+        end += 1;
+    }
+    (start, end)
+}
+
 pub fn backspace(lines: &mut Vec<String>, pos: TextPos) -> TextPos {
     if pos.col > 0 {
         let prev = TextPos { line: pos.line, col: pos.col - 1 };
@@ -836,6 +869,63 @@ mod tests {
             TextPos { line: 0, col: 2 },
         );
         assert_eq!(s, "");
+    }
+
+    // ---- word_range_at (더블클릭 선택) ----
+
+    /// 범위를 눈으로 확인하기 쉽게 잘라서 돌려주는 보조.
+    fn word_at(line: &str, col: usize) -> String {
+        let (a, b) = word_range_at(line, col);
+        line.chars().skip(a).take(b - a).collect()
+    }
+
+    #[test]
+    fn word_range_grabs_space_delimited_chunk() {
+        assert_eq!(word_at("hello world foo", 7), "world");
+    }
+
+    #[test]
+    fn word_range_stops_at_tabs() {
+        // TSV 한 줄: 탭이 경계다.
+        assert_eq!(word_at("aa\tbbb\tcc", 4), "bbb");
+    }
+
+    #[test]
+    fn word_range_keeps_punctuation_inside_the_chunk() {
+        // 공백만 경계이므로 날짜나 점 찍힌 이름이 통째로 잡힌다.
+        assert_eq!(word_at("x 2026-08-27 y", 5), "2026-08-27");
+        assert_eq!(word_at("a.b.c d", 2), "a.b.c");
+    }
+
+    #[test]
+    fn word_range_at_line_start_and_end() {
+        assert_eq!(word_at("abc def", 0), "abc");
+        // 줄 끝(= char 개수)에서 눌러도 마지막 덩어리를 잡는다.
+        assert_eq!(word_at("abc def", 7), "def");
+    }
+
+    #[test]
+    fn word_range_on_whitespace_selects_the_whitespace_run() {
+        // 빈 선택으로 무너지지 않는다.
+        assert_eq!(word_at("ab   cd", 3), "   ");
+    }
+
+    #[test]
+    fn word_range_on_empty_line_is_empty() {
+        assert_eq!(word_range_at("", 0), (0, 0));
+    }
+
+    #[test]
+    fn word_range_whole_line_when_no_whitespace() {
+        assert_eq!(word_at("abcdef", 3), "abcdef");
+    }
+
+    #[test]
+    fn word_range_counts_chars_not_bytes() {
+        // 한글은 UTF-8 3바이트다. col 은 char 인덱스여야 한다.
+        assert_eq!(word_at("가나 다라마 바", 4), "다라마");
+        let (a, b) = word_range_at("가나 다라마 바", 4);
+        assert_eq!((a, b), (3, 6));
     }
 
     #[test]

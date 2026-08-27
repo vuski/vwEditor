@@ -7867,6 +7867,10 @@ fn render_text(
     let drag_head: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
     // Shift+클릭으로 확장할 캐럿 위치. 앵커는 **잡지 않는다**(기존 앵커 유지).
     let shift_click: Cell<Option<crate::edit::TextPos>> = Cell::new(None);
+    // 더블/트리플 클릭이 만든 선택 (anchor, head). 아래 2)에서 드래그가 만든
+    // 선택을 **덮어쓴다** — 같은 프레임에 press 분기가 캐럿 하나로 무너뜨린
+    // 뒤이기 때문.
+    let multi_click: Cell<Option<(crate::edit::TextPos, crate::edit::TextPos)>> = Cell::new(None);
     // 이번 프레임에 "텍스트 줄 위에서" 좌클릭 누름이 진행 중인지.
     let line_press: Cell<bool> = Cell::new(false);
     // 우클릭 대상 줄 위치 + 고른 메뉴 동작.
@@ -8184,6 +8188,32 @@ fn render_text(
                             }
                         }
                     }
+                    // 더블클릭 → 공백으로 구분된 덩어리, 트리플클릭 → 줄 전체.
+                    // Windows 텍스트 상자의 표준 동작이다.
+                    //
+                    // 위 press 분기는 같은 프레임에 캐럿을 하나로 무너뜨린다
+                    // (`clicked()`가 release 프레임에 참이므로 둘 다 돈다).
+                    // 그래서 여기서는 판정만 기록하고, 실제 적용은 아래 2)에서
+                    // 드래그 분기 **뒤에** 한다.
+                    //
+                    // egui의 count는 3에서 멈춘다 — 네 번째부터도 triple로
+                    // 보고되므로 계속 눌러도 줄 선택이 유지된다.
+                    if resp.triple_clicked() {
+                        multi_click.set(Some((
+                            crate::edit::TextPos { line: logical, col: 0 },
+                            crate::edit::TextPos { line: logical, col: len },
+                        )));
+                    } else if resp.double_clicked() {
+                        if let Some(pp) = resp.interact_pointer_pos() {
+                            let at = pos_at_pointer(pp);
+                            let (a, b) = crate::edit::word_range_at(&line, at.col);
+                            multi_click.set(Some((
+                                crate::edit::TextPos { line: logical, col: a },
+                                crate::edit::TextPos { line: logical, col: b },
+                            )));
+                        }
+                    }
+
                     // 드래그 중 확장: 포인터가 이 줄 위 + 줄에서 시작된 드래그.
                     // 다른 줄로 넘어가는 확장은 원 위젯이 포인터를 캡처하므로
                     // contains_pointer()로 감지한다(표 모드와 동일).
@@ -8274,6 +8304,15 @@ fn render_text(
             doc.text_caret = head;
             doc.text_sel = if anchor == head { None } else { Some((anchor, head)) };
         }
+    }
+
+    // 2-b) 더블/트리플 클릭 선택은 드래그가 만든 것을 덮어쓴다. 같은 프레임에
+    //      press 분기가 이미 캐럿 하나로 무너뜨려 놨기 때문에 순서가 중요하다.
+    //      캐럿은 선택 끝(head)에 둔다 — Shift+화살표로 이어서 늘릴 때
+    //      Windows와 같은 방향이 된다.
+    if let Some((a, b)) = multi_click.get() {
+        doc.text_caret = b;
+        doc.text_sel = if a == b { None } else { Some((a, b)) };
     }
 
     // 3) 키 입력 인텐트 적용.
