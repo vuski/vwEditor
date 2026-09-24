@@ -2,10 +2,6 @@
 
 **한국어** | [English](#vweditor-english)
 
-> 이 저장소는 [vuski/vwEditor](https://github.com/vuski/vwEditor)의 포크입니다.
-> 원본 대비 **가로 스크롤**, **컬럼별 필터링**, **zip 안 CSV/TSV 열기(단일 파일)**를
-> 추가했습니다. 아래 설명은 원본 README를 그대로 두고 있습니다.
-
 대용량 CSV/TSV/텍스트 파일을 즉시 여는 뷰어 겸 에디터입니다. Rust + egui.
 parquet 조회도 가능합니다.
 
@@ -32,7 +28,7 @@ parquet 조회도 가능합니다.
 > 다른 백신들의 판정을 비교해 보세요.
 
 > 개인 도구로 만들어 쓰는 중입니다. Windows에서 실사용하며 다듬었고,
-> 831개 테스트가 붙어 있습니다. macOS·Linux는 빌드는 되지만
+> 876개 테스트가 붙어 있습니다. macOS·Linux는 빌드는 되지만
 > **실기 검증을 못 했습니다** — 아래 [플랫폼 지원](#플랫폼-지원)을 참고하세요.
 
 ## 기능
@@ -43,12 +39,14 @@ parquet 조회도 가능합니다.
 - **찾기·바꾸기** — 대소문자·전체 셀 일치 옵션. 전체 바꾸기는 899MB / 15.4M 행에서 약 0.25초.
 - **추출** - 특정 문자열이 포함된 행만 추출할 수 있습니다.
 - **정렬** — 다중 키 정렬. 문자열/숫자 판별.
+- **컬럼 필터** — 헤더의 ▾로 엑셀식 자동 필터. 값 체크박스, 포함 검색, 숫자 범위(최소~최대).
+  여러 컬럼은 AND로 묶이고, 정렬과 함께 쓰면 필터된 행 안에서만 정렬합니다.
+  스캔은 셀 값을 복사하지 않고 mmap을 그대로 읽습니다.
+- **가로 스크롤** — 컬럼이 많아도 잘리지 않습니다. 세로 스크롤바는 항상 창 오른쪽에 붙어 있습니다.
 - **편집·저장** — 인코딩·개행(CRLF/LF)·BOM을 골라 저장합니다. Undo/Redo.
 - **Hex 모드** — 바이너리 파일을 16진수로 봅니다(읽기 전용).
 - **Parquet / GeoParquet** — 읽기 전용. geometry 컬럼은 `POINT(127.02 37.51)`,
   `POLYGON(1,204 pts)` 형태로 요약해 보여줍니다. CSV/TSV로 내보내기 가능합니다.
-- **zip 안 CSV/TSV 열기** — csv/tsv/psv/txt 파일 하나짜리 zip을 그대로 열 수 있습니다
-  (읽기 전용, 저장은 다른 이름으로).
 - **파싱 오류 행 검출** — 따옴표가 안 닫힌 행 등을 찾아 줍니다.
 - **한국어·영어 UI** — 시작할 때 OS 로케일을 따르고, 메뉴 > 언어에서 바꿀 수 있습니다.
 - **멀티탭**, **드래그앤드롭**, **Ctrl+휠 확대**(0.5~4.0배).
@@ -133,7 +131,7 @@ sudo pacman -S noto-fonts-cjk
 ## 개발
 
 ```powershell
-cargo test              # 831개
+cargo test              # 876개
 cargo clippy --all-targets
 cargo build --release
 ```
@@ -150,11 +148,6 @@ cargo build --release
 # vwEditor (English)
 
 [한국어](#vweditor) | **English**
-
-> This repository is a fork of [vuski/vwEditor](https://github.com/vuski/vwEditor).
-> It adds **horizontal scrolling**, **per-column filtering**, and **opening a
-> single CSV/TSV file inside a zip** on top of the original. The description
-> below is kept as-is from the original README.
 
 A viewer and editor that opens large CSV/TSV/text files instantly. Rust + egui.
 It reads parquet files too.
@@ -183,7 +176,7 @@ line positions in the background. The scrollbar grows as indexing progresses.
 > [VirusTotal](https://www.virustotal.com) and compare verdicts across engines.
 
 > This is a personal tool I built for my own use. It has been refined through
-> daily use on Windows and carries 831 tests. macOS and Linux builds compile
+> daily use on Windows and carries 876 tests. macOS and Linux builds compile
 > but **have not been verified on real hardware** — see
 > [Platform Support](#platform-support) below.
 
@@ -195,12 +188,16 @@ line positions in the background. The scrollbar grows as indexing progresses.
 - **Find & replace** — case-sensitivity and whole-cell match options. Replace-all takes about 0.25s on 899MB / 15.4M rows.
 - **Extract** — pull out only the rows containing a given string.
 - **Sort** — multi-key sorting with string/numeric detection.
+- **Column filter** — Excel-style auto filter from the ▾ in each header: value checkboxes,
+  contains search, and a numeric range (min–max). Multiple columns combine with AND; combined
+  with sorting, only the filtered rows are sorted. The scan reads the mmap in place without
+  copying cell values.
+- **Horizontal scrolling** — wide files are never clipped. The vertical scrollbar stays pinned
+  to the right edge of the window.
 - **Edit & save** — choose encoding, line ending (CRLF/LF), and BOM when saving. Undo/redo.
 - **Hex mode** — view binary files as hexadecimal (read-only).
 - **Parquet / GeoParquet** — read-only. Geometry columns are summarized as
   `POINT(127.02 37.51)` or `POLYGON(1,204 pts)`. Exportable to CSV/TSV.
-- **Open CSV/TSV inside a zip** — opens a zip containing a single csv/tsv/psv/txt file
-  directly (read-only; save goes to a new path).
 - **Malformed row detection** — finds rows with unclosed quotes and similar problems.
 - **English and Korean UI** — follows your OS locale at startup; switchable under **Language** in the menu bar.
 - **Multiple tabs**, **drag and drop**, **Ctrl+wheel zoom** (0.5×–4.0×).
@@ -293,7 +290,7 @@ been able to verify them in those environments.
 ## Development
 
 ```powershell
-cargo test              # 831 tests
+cargo test              # 876 tests
 cargo clippy --all-targets
 cargo build --release
 ```

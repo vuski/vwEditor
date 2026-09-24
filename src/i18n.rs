@@ -162,6 +162,23 @@ ui! {
     sort_number_desc     { ko: "숫자 ↓",            en: "Number ↓" }
 
     // ---- 공통 ----
+    // ---- 컬럼 필터 드롭다운 ----
+    filter_title         { ko: "필터 — {}",          en: "Filter — {}" }
+    filter_column_n      { ko: "{}번째 열",          en: "Column {}" }
+    filter_search        { ko: "검색 / 포함:",       en: "Search / contains:" }
+    filter_number_range  { ko: "숫자 범위:",         en: "Number range:" }
+    filter_invalid_number{ ko: "(숫자가 아님)",      en: "(not a number)" }
+    filter_distinct_n    { ko: "고유값 {}개",         en: "{} distinct values" }
+    filter_distinct_est  { ko: "고유값 약 {}개(추정)", en: "~{} distinct values (estimated)" }
+    filter_truncated     { ko: "고유값이 너무 많아 앞 {}개만 보입니다. 위 검색으로 좁히세요.",
+                           en: "Too many distinct values — showing first {}. Use the text filter above to narrow down." }
+    filter_select_all    { ko: "전체 선택",          en: "Select All" }
+    filter_clear_all     { ko: "전체 해제",          en: "Clear All" }
+    filter_apply         { ko: "적용",              en: "Apply" }
+    filter_clear         { ko: "필터 해제",          en: "Clear Filter" }
+    filter_scanning      { ko: "스캔 중…",           en: "Scanning…" }
+    filter_blank         { ko: "(빈 값)",            en: "(blank)" }
+
     common_cancel        { ko: "취소",              en: "Cancel" }
     common_continue      { ko: "계속",              en: "Continue" }
     common_close         { ko: "닫기",              en: "Close" }

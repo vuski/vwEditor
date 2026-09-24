@@ -111,6 +111,10 @@ struct SortShared {
     result: Mutex<Option<Vec<u32>>>,
     /// 작업 완료(성공/취소 무관) 플래그.
     finished: AtomicBool,
+    /// 호출측이 핸들을 버렸다(새 정렬로 교체 등). 워커는 다음 청크 경계에서
+    /// 이 플래그를 보고 빠져나온다 — 안 그러면 큰 파일에서 정렬 버튼을 연달아
+    /// 누를 때 버려진 전체 스캔이 CPU를 나눠 먹으며 끝까지 돈다.
+    cancel: AtomicBool,
 }
 
 /// 백그라운드 정렬 작업 핸들. UI가 소유하며 진행률 폴링 + 결과 수거에 쓴다.
@@ -123,6 +127,15 @@ pub struct SortJob {
     pub dir: SortDir,
     /// 다중 정렬 기준(2개 이상이면 다중). 단일이면 비어 있다.
     pub specs: Vec<SortSpec>,
+}
+
+/// 핸들이 버려지면 워커에 취소를 알린다. join은 하지 않는다 — UI 스레드에서
+/// 드롭되므로 스캔이 끝날 때까지 화면이 멈추면 안 된다. 스레드는 다음 청크
+/// 경계에서 스스로 빠져나와 정리된다.
+impl Drop for SortJob {
+    fn drop(&mut self) {
+        self.shared.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl SortJob {
@@ -173,6 +186,7 @@ pub fn spawn_sort(
         total_rows,
         result: Mutex::new(None),
         finished: AtomicBool::new(false),
+        cancel: AtomicBool::new(false),
     });
 
     let shared_bg = shared.clone();
@@ -183,6 +197,7 @@ pub fn spawn_sort(
             move |n: usize| {
                 shared.rows_done.fetch_add(n as u64, Ordering::Relaxed);
                 ctx.request_repaint();
+                !shared.cancel.load(Ordering::Relaxed)
             }
         };
         let perm = extract_and_sort(
@@ -233,6 +248,7 @@ pub fn spawn_multi_sort(
         total_rows,
         result: Mutex::new(None),
         finished: AtomicBool::new(false),
+        cancel: AtomicBool::new(false),
     });
     // 1차 기준(비었으면 기본값 — 호출측이 빈 specs로 부르지 않도록 보장).
     let first = specs.first().copied().unwrap_or(SortSpec {
@@ -251,6 +267,7 @@ pub fn spawn_multi_sort(
             move |n: usize| {
                 shared.rows_done.fetch_add(n as u64, Ordering::Relaxed);
                 ctx.request_repaint();
+                !shared.cancel.load(Ordering::Relaxed)
             }
         };
         let perm = extract_and_multi_sort(
@@ -294,6 +311,11 @@ pub fn spawn_multi_sort(
 /// - 비수치(숫자 정렬)/빈값/컬럼 없는 행은 방향과 무관하게 맨 뒤로 간다.
 /// - 안정성: 키가 같으면 원본 행번호 순서를 유지(tie-break).
 /// - `progress`: 키 추출 진행을 알리는 콜백(처리한 행 수 누적). None이면 무시.
+///   **`false`를 돌려주면 취소다** — 남은 청크는 건너뛰고 정렬도 하지 않은 채
+///   빈 permutation을 돌려준다. 호출측(`SortJob`)이 버려진 작업을 이 통로로
+///   멈춘다(`SortJob::drop` 참조). 콜백을 취소 채널로 겸하는 이유: 별도
+///   `cancel` 인자를 추가하면 테스트 수십 곳의 호출을 다 고쳐야 하는데,
+///   그 호출들은 전부 `None`이라 이 방식이면 손댈 곳이 없다.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_and_sort(
     source: &Arc<Source>,
@@ -305,7 +327,7 @@ pub fn extract_and_sort(
     kind: SortKind,
     dir: SortDir,
     ci: bool,
-    progress: Option<&(dyn Fn(usize) + Sync)>,
+    progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
 ) -> Vec<u32> {
     let total = index.line_count();
     if total <= data_start {
@@ -329,11 +351,16 @@ pub fn extract_and_sort(
     // 랜덤 접근 대비 캐시 효율이 크게 오른다.
     let mut keyed: Vec<(Key, bool, u32)> = vec![(0, false, 0); data_rows];
     const CHUNK: usize = 64 * 1024; // 워커당 순차 처리 단위
-    let done_counter = std::sync::atomic::AtomicUsize::new(0);
+    // 취소는 청크 경계에서만 확인한다 — 행마다 원자값을 읽으면 hot loop에
+    // 부담이고, 청크(64K행)는 어차피 수십 ms면 지나간다.
+    let cancelled = AtomicBool::new(false);
     keyed
         .par_chunks_mut(CHUNK)
         .enumerate()
         .for_each(|(chunk_idx, chunk)| {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             let base = chunk_idx * CHUNK;
             for (j, slot) in chunk.iter_mut().enumerate() {
                 let i = base + j;
@@ -342,13 +369,16 @@ pub fn extract_and_sort(
                     extract_key_fast(bytes, offsets, total_bytes, enc, delim, col, kind, ci, logical);
                 *slot = (key, truncated, logical as u32);
             }
+            // 청크 하나 끝날 때마다 처리 행 수 보고(콜백 빈도 낮춤).
             if let Some(p) = progress {
-                // 청크 하나 끝날 때마다 처리 행 수 보고(콜백 빈도 낮춤).
-                let d = done_counter.fetch_add(chunk.len(), Ordering::Relaxed) + chunk.len();
-                let _ = d;
-                p(chunk.len());
+                if !p(chunk.len()) {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
             }
         });
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
 
     // 정수 키 비교로 정렬. 키가 같을 때:
     // - 문자 정렬 & 양쪽 모두 truncated: 앞 8바이트(PREFIX_LEN)만 같을 뿐 뒤가 다를 수
@@ -472,7 +502,7 @@ pub fn extract_and_multi_sort(
     delim: u8,
     specs: &[SortSpec],
     data_start: usize,
-    progress: Option<&(dyn Fn(usize) + Sync)>,
+    progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
 ) -> Vec<u32> {
     let total = index.line_count();
     if total <= data_start || specs.is_empty() {
@@ -487,7 +517,11 @@ pub fn extract_and_multi_sort(
     // 키 배열 + 원본 행번호. par_chunks_mut로 각 워커가 자기 구간 순차 순회.
     let mut keyed: Vec<([u64; MAX_KEYS], u32)> = vec![([0u64; MAX_KEYS], 0); data_rows];
     const CHUNK: usize = 64 * 1024;
+    let cancelled = AtomicBool::new(false);
     keyed.par_chunks_mut(CHUNK).enumerate().for_each(|(ci, chunk)| {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
         let base = ci * CHUNK;
         for (j, slot) in chunk.iter_mut().enumerate() {
             let logical = data_start + base + j;
@@ -495,9 +529,14 @@ pub fn extract_and_multi_sort(
             *slot = (keys, logical as u32);
         }
         if let Some(p) = progress {
-            p(chunk.len());
+            if !p(chunk.len()) {
+                cancelled.store(true, Ordering::Relaxed);
+            }
         }
     });
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
 
     // 키 배열 사전식 비교(방향은 키에 이미 인코딩됨) → 동률이면 행번호로 안정화.
     keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -519,7 +558,7 @@ pub fn extract_and_multi_sort_subset(
     delim: u8,
     specs: &[SortSpec],
     rows: &[u32],
-    progress: Option<&(dyn Fn(usize) + Sync)>,
+    progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
 ) -> Vec<u32> {
     if rows.is_empty() || specs.is_empty() {
         return Vec::new();
@@ -530,7 +569,11 @@ pub fn extract_and_multi_sort_subset(
 
     let mut keyed: Vec<([u64; MAX_KEYS], u32)> = vec![([0u64; MAX_KEYS], 0); rows.len()];
     const CHUNK: usize = 64 * 1024;
+    let cancelled = AtomicBool::new(false);
     keyed.par_chunks_mut(CHUNK).enumerate().for_each(|(ci, chunk)| {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
         let base = ci * CHUNK;
         for (j, slot) in chunk.iter_mut().enumerate() {
             let logical = rows[base + j] as usize;
@@ -538,9 +581,14 @@ pub fn extract_and_multi_sort_subset(
             *slot = (keys, rows[base + j]);
         }
         if let Some(p) = progress {
-            p(chunk.len());
+            if !p(chunk.len()) {
+                cancelled.store(true, Ordering::Relaxed);
+            }
         }
     });
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
 
     keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
@@ -714,6 +762,22 @@ mod tests {
         let h = crate::indexer::spawn_indexer(src.clone(), idx.clone(), Encoding::Utf8, ctx);
         h.join().unwrap();
         (src, idx)
+    }
+
+    #[test]
+    fn progress_returning_false_cancels_sort() {
+        let p = temp(b"3\n1\n2\n");
+        let src = Arc::new(source::open(&p).unwrap());
+        let idx = LineIndex::new(src.len());
+        crate::indexer::spawn_indexer(src.clone(), idx.clone(), Encoding::Utf8, egui::Context::default())
+            .join()
+            .unwrap();
+        let stop = |_: usize| false;
+        let perm = extract_and_sort(&src, &idx, Encoding::Utf8, b',', 0, 0, SortKind::Number, SortDir::Asc, false, Some(&stop));
+        assert!(perm.is_empty(), "취소된 정렬은 빈 permutation");
+        let specs = [SortSpec { col: 0, kind: SortKind::Number, dir: SortDir::Asc, ci: false }];
+        assert!(extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, Some(&stop)).is_empty());
+        assert!(extract_and_multi_sort_subset(&src, &idx, Encoding::Utf8, b',', &specs, &[0, 1, 2], Some(&stop)).is_empty());
     }
 
     #[test]

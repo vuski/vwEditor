@@ -2,25 +2,42 @@ use crate::index::LineIndex;
 use crate::parse::{self, Encoding};
 use crate::source::Source;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// 컬럼 하나에 거는 엑셀 자동필터 스타일 조건. 두 조건은 함께 있으면 AND다.
-/// - `contains`: 부분 문자열 포함(대소문자 무시). 비어 있으면 조건 없음.
+/// 컬럼 하나에 거는 엑셀 자동필터 스타일 조건. 조건들은 함께 있으면 AND다.
+/// - `contains`: 부분 문자열 포함. ASCII는 대소문자 무시, 그 밖(한글 등)은
+///   리터럴 비교 — 찾기(`find::find_ci_ascii`)와 같은 규칙이라 두 기능이
+///   같은 입력에 같은 행을 잡는다. 비어 있으면 조건 없음.
 /// - `included`: 체크박스로 고른 "포함할 값" 집합. `None`이면 값 목록 조건 없음
 ///   (엑셀의 "전체 선택" 상태와 같다). `Some(set)`이면 이 집합에 있는 값만 통과.
+/// - `min`/`max`: 숫자 범위(경계 포함). 한쪽만 있으면 이상/이하, 둘이 같으면
+///   등호다. 셀이 숫자로 읽히지 않으면(빈 값·문자) 통과하지 못한다. 숫자
+///   해석은 숫자 정렬(`sort::number_key`)과 같다 — 앞뒤 공백을 떼고 f64로
+///   파싱. 컬럼 타입 감지는 하지 않는다: 어느 컬럼에나 걸 수 있고, 스캔 중
+///   셀마다 그 자리에서 파싱한다(문자열 할당 없음).
 #[derive(Debug, Clone, Default)]
 pub struct ColumnFilter {
     pub contains: String,
     pub included: Option<HashSet<String>>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
 }
 
 impl ColumnFilter {
     /// 아무 조건도 없는지(= 이 컬럼에 필터가 없는 것과 같은지).
     pub fn is_noop(&self) -> bool {
-        self.contains.trim().is_empty() && self.included.is_none()
+        self.contains.trim().is_empty() && self.included.is_none() && self.min.is_none() && self.max.is_none()
     }
+}
+
+/// 셀 값을 숫자 조건용 f64로 읽는다. 규칙은 `sort::number_key`와 같다. NaN은
+/// 어떤 비교도 거짓이라 "숫자 아님"으로 본다 — 안 그러면 `"NaN"` 셀이
+/// `min`/`max` 어느 쪽에도 걸리지 않고 통과한다.
+pub fn parse_number(v: &str) -> Option<f64> {
+    v.trim().parse::<f64>().ok().filter(|x| !x.is_nan())
 }
 
 /// 필터를 전체 데이터에 적용한 결과. `matched`는 조건을 통과한 데이터 행의
@@ -157,59 +174,81 @@ fn trim_newline(b: &[u8]) -> &[u8] {
 
 /// 필드 raw 바이트 → 화면에 보이는 값(따옴표 벗김 + 디코딩).
 ///
-/// `parse::field_slice`는 속도를 위해 인용 부호를 슬라이스에 그대로 남긴다
-/// (`sort.rs`의 정렬 키가 같은 사정으로 quote를 안 벗기는 것과 동일). 체크박스
-/// 목록이나 포함 비교는 셀에 실제로 보이는 값과 일치해야 하므로, 여기서 한 번
-/// 정규화한다. 멀티라인 인용 필드(필드 안에 실제 개행이 든 경우)는 애초에
-/// `field_slice`가 줄 단위로만 보므로 다루지 않는다 — 정렬 키 추출과 같은
-/// 한계이고, 이 앱에서 이미 감수하고 있는 근사치다.
-fn field_display_value(bytes: &[u8], enc: Encoding) -> String {
-    let s = parse::decode_line(bytes, enc);
+/// 원본 필드 슬라이스 → 화면 표시값. `parse::field_slice`는 속도를 위해 인용
+/// 부호를 슬라이스에 그대로 남기므로(`sort.rs`의 정렬 키와 같은 사정) 여기서
+/// 바깥 따옴표를 벗긴다. 체크박스 목록·포함 비교·숫자 파싱은 셀에 실제로
+/// 보이는 값과 일치해야 하기 때문이다. `""` 이스케이프가 안에 있을 때만
+/// 할당하고, 그 외에는 빌린다. 멀티라인 인용 필드(필드 안 실제 개행)는
+/// `field_slice`가 줄 단위로만 보므로 다루지 않는다 — 정렬 키와 같은 한계.
+fn unquote(s: &str) -> Cow<'_, str> {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        s[1..s.len() - 1].replace("\"\"", "\"")
+        let inner = &s[1..s.len() - 1];
+        if inner.contains("\"\"") {
+            Cow::Owned(inner.replace("\"\"", "\""))
+        } else {
+            Cow::Borrowed(inner)
+        }
     } else {
-        s
+        Cow::Borrowed(s)
     }
 }
 
-/// 한 행의 선택 컬럼 값을 화면 표시용 문자열로 얻는다(락 없는 hot path).
-/// 컬럼이 없는 행은 빈 문자열로 취급한다(정렬의 `empty_key`와 같은 정책).
-fn row_field_value(
-    bytes: &[u8],
+/// 한 행의 선택 컬럼 값을 **빌려서** 얻는다(락 없는 hot path). 컬럼이 없는
+/// 행은 빈 문자열로 취급한다(정렬의 `empty_key`와 같은 정책).
+///
+/// UTF-8은 mmap 슬라이스를 그대로 빌린다 — 행마다·조건마다 `String`을 만들던
+/// 이전 구현은 수억 행에서 할당이 스캔 비용을 지배했다. 따옴표 이스케이프가
+/// 있는 셀과 잘못된 UTF-8(lossy 디코딩)만 할당한다. CP949/UTF-16은 디코딩
+/// 자체가 새 버퍼를 요구하므로 할당한다(드문 경로).
+#[allow(clippy::too_many_arguments)]
+fn row_field<'a>(
+    bytes: &'a [u8],
     offsets: &[u64],
     total_bytes: u64,
     enc: Encoding,
     delim: u8,
     col: usize,
     logical: usize,
-) -> String {
+) -> Cow<'a, str> {
     let Some((s, e)) = LineIndex::range_in(offsets, total_bytes, logical) else {
-        return String::new();
+        return Cow::Borrowed("");
     };
     let raw = &bytes[s as usize..e as usize];
     match enc {
-        Encoding::Utf8 | Encoding::Cp949 => {
+        Encoding::Utf8 => {
             let line = trim_newline(raw);
             match parse::field_slice(line, delim, col) {
-                Some(field) => field_display_value(field, enc),
-                None => String::new(),
+                Some(field) => match std::str::from_utf8(field) {
+                    Ok(f) => unquote(f),
+                    Err(_) => Cow::Owned(unquote(&String::from_utf8_lossy(field)).into_owned()),
+                },
+                None => Cow::Borrowed(""),
+            }
+        }
+        Encoding::Cp949 => {
+            let line = trim_newline(raw);
+            match parse::field_slice(line, delim, col) {
+                Some(field) => Cow::Owned(unquote(&parse::decode_line(field, enc)).into_owned()),
+                None => Cow::Borrowed(""),
             }
         }
         Encoding::Utf16Le | Encoding::Utf16Be => {
             let text = parse::decode_line(raw, enc);
             let fields = parse::split_fields(text.trim_end_matches(['\r', '\n']), delim);
-            fields.get(col).cloned().unwrap_or_default()
+            Cow::Owned(fields.into_iter().nth(col).unwrap_or_default())
         }
     }
 }
 
-/// `row_field_value`의 편집 버퍼(인메모리) 버전. 편집 버퍼는 이미 디코딩된
-/// UTF-8 `String` 줄이라(`crate::edit::load_edit_buffer`) 인코딩 분기가
-/// 필요 없다 — 그래서 mmap 경로처럼 `Encoding`을 받지 않는다.
-fn line_field_value(line: &str, delim: u8, col: usize) -> String {
+/// `row_field`의 편집 버퍼(인메모리) 버전. 편집 버퍼는 이미 디코딩된 UTF-8
+/// `String` 줄이라(`crate::edit::load_edit_buffer`) 인코딩 분기가 없다.
+/// `field_slice`는 ASCII 구분자·따옴표 경계로만 자르고 UTF-8에서 ASCII
+/// 바이트는 멀티바이트 문자 안에 나타나지 않으므로, 슬라이스도 유효한
+/// UTF-8이다.
+fn line_field<'a>(line: &'a str, delim: u8, col: usize) -> Cow<'a, str> {
     match parse::field_slice(line.as_bytes(), delim, col) {
-        Some(field) => field_display_value(field, Encoding::Utf8),
-        None => String::new(),
+        Some(field) => unquote(std::str::from_utf8(field).unwrap_or("")),
+        None => Cow::Borrowed(""),
     }
 }
 
@@ -224,9 +263,9 @@ pub fn extract_distinct_lines(lines: &[String], delim: u8, col: usize, data_star
     let mut map: HashMap<String, u64> = HashMap::new();
     let mut hll = HyperLogLog::new();
     for line in &lines[data_start..] {
-        let v = line_field_value(line, delim, col);
+        let v = line_field(line, delim, col);
         hll.insert(&v);
-        capped_bump(&mut map, v, EXACT_COUNT_CAP);
+        capped_bump(&mut map, &v, EXACT_COUNT_CAP);
     }
     let count = if map.len() < EXACT_COUNT_CAP {
         DistinctCount::Exact(map.len())
@@ -259,18 +298,9 @@ pub fn apply_filters_lines(
     (data_start..lines.len())
         .into_par_iter()
         .filter(|&logical| {
-            compiled.iter().all(|c| {
-                let value = line_field_value(&lines[logical], delim, c.col);
-                if !c.contains_lower.is_empty() && !value.to_lowercase().contains(&c.contains_lower) {
-                    return false;
-                }
-                if let Some(set) = &c.included {
-                    if !set.contains(&value) {
-                        return false;
-                    }
-                }
-                true
-            })
+            compiled
+                .iter()
+                .all(|c| value_passes(c, &line_field(&lines[logical], delim, c.col)))
         })
         .map(|l| l as u32)
         .collect()
@@ -286,7 +316,7 @@ pub fn extract_distinct(
     delim: u8,
     col: usize,
     data_start: usize,
-    progress: Option<&(dyn Fn(usize) + Sync)>,
+    progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
 ) -> DistinctResult {
     let total = index.line_count();
     if total <= data_start {
@@ -298,6 +328,7 @@ pub fn extract_distinct(
     let bytes = source.as_bytes();
 
     let n_chunks = data_rows.div_ceil(CHUNK);
+    let cancelled = AtomicBool::new(false);
     // 청크마다 (상한 걸린 해시맵, HyperLogLog 스케치)를 함께 만든다. 해시맵은
     // `EXACT_COUNT_CAP`(5,000)을 넘으면 새 값을 안 담지만, HLL은 원소를 저장하지
     // 않으므로 상한 없이 전체 행을 계속 반영한다 — 그래서 정확 카운트가 상한을
@@ -305,20 +336,25 @@ pub fn extract_distinct(
     let (merged, hll): (HashMap<String, u64>, HyperLogLog) = (0..n_chunks)
         .into_par_iter()
         .map(|chunk_idx| {
-            let base = data_start + chunk_idx * CHUNK;
-            let end = (base + CHUNK).min(total);
             let mut local: HashMap<String, u64> = HashMap::new();
             let mut local_hll = HyperLogLog::new();
+            if cancelled.load(Ordering::Relaxed) {
+                return (local, local_hll);
+            }
+            let base = data_start + chunk_idx * CHUNK;
+            let end = (base + CHUNK).min(total);
             for logical in base..end {
-                let v = row_field_value(bytes, offsets, total_bytes, enc, delim, col, logical);
+                let v = row_field(bytes, offsets, total_bytes, enc, delim, col, logical);
                 local_hll.insert(&v);
                 // 청크 하나(최대 CHUNK=64K행)는 어차피 그 크기로 자연히
                 // 제한되지만, 여기서도 상한을 적용해 두면 이미 상한에 닿은
                 // 청크는 새 키 삽입 없이 카운트만 갱신하며 더 빨리 지나간다.
-                capped_bump(&mut local, v, EXACT_COUNT_CAP);
+                capped_bump(&mut local, &v, EXACT_COUNT_CAP);
             }
             if let Some(p) = progress {
-                p(end - base);
+                if !p(end - base) {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
             }
             (local, local_hll)
         })
@@ -350,6 +386,9 @@ pub fn extract_distinct(
             },
         );
 
+    if cancelled.load(Ordering::Relaxed) {
+        return DistinctResult { values: Vec::new(), truncated: false, count: DistinctCount::Exact(0) };
+    }
     let count = if merged.len() < EXACT_COUNT_CAP {
         // 상한에 안 닿았다 = 스캔 도중 버려진 새 값이 없었다 = 이게 진짜 정확한
         // 개수다.
@@ -367,20 +406,26 @@ pub fn extract_distinct(
 
 /// 상한 내에서만 새 키를 추가하고, 이미 있는 키는 상한과 무관하게 카운트를
 /// 올린다(청크 로컬 누적용 — `extract_distinct`의 reduce 상한과 같은 정책).
-fn capped_bump(map: &mut HashMap<String, u64>, key: String, cap: usize) {
-    if let Some(c) = map.get_mut(&key) {
+/// 키를 `&str`로 받아 **처음 보는 값일 때만** `String`을 만든다 — 값이 반복되는
+/// 보통의 컬럼(코드·지역명 등)에서는 스캔 전체에 할당이 고유값 수만큼뿐이다.
+fn capped_bump(map: &mut HashMap<String, u64>, key: &str, cap: usize) {
+    if let Some(c) = map.get_mut(key) {
         *c += 1;
     } else if map.len() < cap {
-        map.insert(key, 1);
+        map.insert(key.to_owned(), 1);
     }
 }
 
-/// 조건을 미리 컴파일한 형태 — 스캔 루프 안에서 `to_lowercase()`를 조건마다
-/// 매 행 반복하지 않도록 필요한 값(소문자화된 needle)을 한 번만 만든다.
+/// 조건을 미리 컴파일한 형태 — needle의 ASCII 접기를 한 번만 해 두고, 스캔
+/// 루프에서는 셀 값을 빌린 채로만 비교한다.
 struct Compiled {
     col: usize,
-    contains_lower: String,
+    /// `find::find_ci_ascii`가 받는 형태: ASCII만 소문자로 접은 needle 바이트.
+    /// 비어 있으면 포함 조건 없음.
+    contains_lower: Vec<u8>,
     included: Option<HashSet<String>>,
+    min: Option<f64>,
+    max: Option<f64>,
 }
 
 fn compile(filters: &[(usize, ColumnFilter)]) -> Vec<Compiled> {
@@ -388,10 +433,33 @@ fn compile(filters: &[(usize, ColumnFilter)]) -> Vec<Compiled> {
         .iter()
         .map(|(col, f)| Compiled {
             col: *col,
-            contains_lower: f.contains.to_lowercase(),
+            contains_lower: f.contains.trim().to_ascii_lowercase().into_bytes(),
             included: f.included.clone(),
+            min: f.min,
+            max: f.max,
         })
         .collect()
+}
+
+/// 셀 표시값 하나가 컬럼 조건을 통과하는가. 할당 없음: 포함 비교는
+/// `find_ci_ascii`(memchr 기반, 찾기와 같은 규칙), 집합 조회는 `&str`로,
+/// 숫자는 그 자리에서 파싱한다.
+fn value_passes(c: &Compiled, v: &str) -> bool {
+    if !c.contains_lower.is_empty() && crate::find::find_ci_ascii(v.as_bytes(), &c.contains_lower).is_none() {
+        return false;
+    }
+    if let Some(set) = &c.included {
+        if !set.contains(v) {
+            return false;
+        }
+    }
+    if c.min.is_some() || c.max.is_some() {
+        let Some(x) = parse_number(v) else { return false };
+        if c.min.is_some_and(|lo| x < lo) || c.max.is_some_and(|hi| x > hi) {
+            return false;
+        }
+    }
+    true
 }
 
 fn row_passes(
@@ -403,18 +471,9 @@ fn row_passes(
     compiled: &[Compiled],
     logical: usize,
 ) -> bool {
-    compiled.iter().all(|c| {
-        let value = row_field_value(bytes, offsets, total_bytes, enc, delim, c.col, logical);
-        if !c.contains_lower.is_empty() && !value.to_lowercase().contains(&c.contains_lower) {
-            return false;
-        }
-        if let Some(set) = &c.included {
-            if !set.contains(&value) {
-                return false;
-            }
-        }
-        true
-    })
+    compiled
+        .iter()
+        .all(|c| value_passes(c, &row_field(bytes, offsets, total_bytes, enc, delim, c.col, logical)))
 }
 
 /// 필터 조건들을 전체 데이터에 적용해 통과한 행의 논리 행번호를 오름차순으로
@@ -427,7 +486,7 @@ pub fn apply_filters(
     delim: u8,
     filters: &[(usize, ColumnFilter)],
     data_start: usize,
-    progress: Option<&(dyn Fn(usize) + Sync)>,
+    progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
 ) -> Vec<u32> {
     let total = index.line_count();
     if total <= data_start {
@@ -443,23 +502,32 @@ pub fn apply_filters(
 
     let data_rows = total - data_start;
     let n_chunks = data_rows.div_ceil(CHUNK);
+    let cancelled = AtomicBool::new(false);
     let chunks: Vec<Vec<u32>> = (0..n_chunks)
         .into_par_iter()
         .map(|chunk_idx| {
+            let mut local = Vec::new();
+            if cancelled.load(Ordering::Relaxed) {
+                return local;
+            }
             let base = data_start + chunk_idx * CHUNK;
             let end = (base + CHUNK).min(total);
-            let mut local = Vec::new();
             for logical in base..end {
                 if row_passes(bytes, offsets, total_bytes, enc, delim, &compiled, logical) {
                     local.push(logical as u32);
                 }
             }
             if let Some(p) = progress {
-                p(end - base);
+                if !p(end - base) {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
             }
             local
         })
         .collect();
+    if cancelled.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
 
     let mut matched = Vec::with_capacity(data_rows / 4);
     for chunk in chunks {
@@ -473,6 +541,9 @@ pub fn apply_filters(
 struct DistinctShared {
     rows_done: AtomicU64,
     total_rows: u64,
+    /// 핸들이 버려졌다(`Drop`). 워커는 청크 경계에서 보고 빠져나온다 —
+    /// `sort::SortShared::cancel`과 같은 이유.
+    cancel: AtomicBool,
     result: Mutex<Option<DistinctResult>>,
     finished: AtomicBool,
 }
@@ -482,6 +553,12 @@ struct DistinctShared {
 pub struct DistinctJob {
     shared: Arc<DistinctShared>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for DistinctJob {
+    fn drop(&mut self) {
+        self.shared.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl DistinctJob {
@@ -524,6 +601,7 @@ pub fn spawn_distinct_values(
         total_rows,
         result: Mutex::new(None),
         finished: AtomicBool::new(false),
+        cancel: AtomicBool::new(false),
     });
 
     let shared_bg = shared.clone();
@@ -534,6 +612,7 @@ pub fn spawn_distinct_values(
             move |n: usize| {
                 shared.rows_done.fetch_add(n as u64, Ordering::Relaxed);
                 ctx.request_repaint();
+                !shared.cancel.load(Ordering::Relaxed)
             }
         };
         let result = extract_distinct(&source, &index, enc, delim, col, data_start, Some(&progress));
@@ -549,6 +628,9 @@ pub fn spawn_distinct_values(
 struct FilterShared {
     rows_done: AtomicU64,
     total_rows: u64,
+    /// 핸들이 버려졌다(`Drop`). 워커는 청크 경계에서 보고 빠져나온다 —
+    /// `sort::SortShared::cancel`과 같은 이유.
+    cancel: AtomicBool,
     result: Mutex<Option<Vec<u32>>>,
     finished: AtomicBool,
 }
@@ -561,6 +643,12 @@ pub struct FilterJob {
     /// 호출측이 헤더 화살표 등 표시용 `SortState`를 이 값으로 채운다 —
     /// 실제 정렬은 이미 `matched`(반환값) 순서에 반영돼 있다.
     pub specs: Vec<crate::sort::SortSpec>,
+}
+
+impl Drop for FilterJob {
+    fn drop(&mut self) {
+        self.shared.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl FilterJob {
@@ -611,6 +699,7 @@ pub fn spawn_apply_filters(
         total_rows,
         result: Mutex::new(None),
         finished: AtomicBool::new(false),
+        cancel: AtomicBool::new(false),
     });
 
     let shared_bg = shared.clone();
@@ -622,6 +711,7 @@ pub fn spawn_apply_filters(
             move |n: usize| {
                 shared.rows_done.fetch_add(n as u64, Ordering::Relaxed);
                 ctx.request_repaint();
+                !shared.cancel.load(Ordering::Relaxed)
             }
         };
         let matched = apply_filters(&source, &index, enc, delim, &filters, data_start, Some(&progress));
@@ -629,11 +719,11 @@ pub fn spawn_apply_filters(
         // 콜백은 필터 단계(보통 지배적인 비용 — 전체 파일을 훑는 쪽)에만
         // 붙인다; 정렬 단계는 이미 걸러진 작은 집합이라 굳이 진행률을 또
         // 보고할 만큼 오래 걸리지 않는다.
-        let matched = if specs_bg.is_empty() {
+        let matched = if specs_bg.is_empty() || shared_bg.cancel.load(Ordering::Relaxed) {
             matched
         } else {
             crate::sort::extract_and_multi_sort_subset(
-                &source, &index, enc, delim, &specs_bg, &matched, None,
+                &source, &index, enc, delim, &specs_bg, &matched, Some(&progress),
             )
         };
         shared_bg.rows_done.store(shared_bg.total_rows, Ordering::Relaxed);
@@ -671,6 +761,128 @@ mod tests {
         (src, idx)
     }
 
+    fn contains(s: &str) -> ColumnFilter {
+        ColumnFilter { contains: s.to_owned(), ..Default::default() }
+    }
+
+    fn range(min: Option<f64>, max: Option<f64>) -> ColumnFilter {
+        ColumnFilter { min, max, ..Default::default() }
+    }
+
+    #[test]
+    fn numeric_range_bounds_are_inclusive_and_nonnumeric_cells_fail() {
+        // 1, 2.5, 10, 문자, 빈 값, 공백 섞인 숫자, NaN
+        let (src, idx) = open_indexed(b"1\n2.5\n10\nabc\n\n 7 \nNaN\n");
+        let f = |lo, hi| apply_filters(&src, &idx, Encoding::Utf8, b',', &[(0, range(lo, hi))], 0, None);
+        assert_eq!(f(Some(2.5), None), vec![1, 2, 5], "이상: 경계 포함, abc/빈값/NaN 제외");
+        assert_eq!(f(None, Some(2.5)), vec![0, 1], "이하: 경계 포함");
+        assert_eq!(f(Some(2.0), Some(9.0)), vec![1, 5], "사이");
+        assert_eq!(f(Some(10.0), Some(10.0)), vec![2], "같음");
+    }
+
+    #[test]
+    fn numeric_range_works_in_edit_buffer_too() {
+        let lines: Vec<String> = ["v", "3", "x", "30"].iter().map(|s| s.to_string()).collect();
+        let m = apply_filters_lines(&lines, &[(0, range(Some(5.0), None))], b',', 1);
+        assert_eq!(m, vec![3]);
+    }
+
+    #[test]
+    fn contains_folds_ascii_case_and_matches_hangul_literally() {
+        let (src, idx) = open_indexed("Apple\napple\n사과\nBanana\n".as_bytes());
+        let f = |q: &str| apply_filters(&src, &idx, Encoding::Utf8, b',', &[(0, contains(q))], 0, None);
+        assert_eq!(f("APP"), vec![0, 1], "ASCII는 대소문자 무시");
+        assert_eq!(f("사과"), vec![2], "한글은 리터럴 비교");
+        assert_eq!(f("nan"), vec![3]);
+        assert!(f("zzz").is_empty());
+    }
+
+    #[test]
+    fn quoted_cells_are_compared_by_displayed_value_without_allocating_plain_ones() {
+        // 따옴표 셀은 벗겨서 비교하고, `""` 이스케이프도 풀어서 본다.
+        let (src, idx) = open_indexed(b"\"a,b\",1\n\"say \"\"hi\"\"\",2\nplain,3\n");
+        let inc = |vals: &[&str]| ColumnFilter {
+            included: Some(vals.iter().map(|v| v.to_string()).collect()),
+            ..Default::default()
+        };
+        let f = |cf| apply_filters(&src, &idx, Encoding::Utf8, b',', &[(0, cf)], 0, None);
+        assert_eq!(f(inc(&["a,b"])), vec![0]);
+        assert_eq!(f(inc(&["say \"hi\""])), vec![1]);
+        assert_eq!(f(inc(&["plain"])), vec![2]);
+        // 빌리기 경로 직접 확인: 평범한 셀은 Borrowed, 이스케이프 셀만 Owned.
+        assert!(matches!(unquote("plain"), Cow::Borrowed(_)));
+        assert!(matches!(unquote("\"a,b\""), Cow::Borrowed(_)));
+        assert!(matches!(unquote("\"x\"\"y\""), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn is_noop_accounts_for_numeric_bounds() {
+        assert!(ColumnFilter::default().is_noop());
+        assert!(!range(Some(1.0), None).is_noop());
+        assert!(!range(None, Some(1.0)).is_noop());
+    }
+
+    #[test]
+    fn parse_number_matches_sort_rules() {
+        assert_eq!(parse_number(" 12.5 "), Some(12.5));
+        assert_eq!(parse_number("-3"), Some(-3.0));
+        assert_eq!(parse_number("1e3"), Some(1000.0));
+        assert_eq!(parse_number(""), None);
+        assert_eq!(parse_number("abc"), None);
+        assert_eq!(parse_number("NaN"), None);
+    }
+
+    #[test]
+    fn progress_returning_false_cancels_filter_and_distinct_scans() {
+        let (src, idx) = open_indexed(b"a\nb\na\n");
+        let stop = |_: usize| false;
+        let m = apply_filters(&src, &idx, Encoding::Utf8, b',', &[(0, contains("a"))], 0, Some(&stop));
+        assert!(m.is_empty(), "취소되면 부분 결과도 돌려주지 않는다");
+        let d = extract_distinct(&src, &idx, Encoding::Utf8, b',', 0, 0, Some(&stop));
+        assert!(d.values.is_empty());
+        // 대조군: 계속하라고 하면 정상 결과.
+        let go = |_: usize| true;
+        let m = apply_filters(&src, &idx, Encoding::Utf8, b',', &[(0, contains("a"))], 0, Some(&go));
+        assert_eq!(m, vec![0, 2]);
+    }
+
+    /// 필터 스캔 속도 실측. 대상은 `TV_PERF_FILE`(CSV, 헤더 1줄)로 지정하고
+    /// 평소에는 건너뛴다(`app.rs`의 정렬 perf 테스트와 같은 규율):
+    /// `$env:TV_PERF_FILE="...ig.csv"; cargo test --release perf_filter_scan -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_filter_scan() {
+        let Ok(path) = std::env::var("TV_PERF_FILE") else {
+            eprintln!("TV_PERF_FILE 미지정 — 건너뜀");
+            return;
+        };
+        let src = Arc::new(source::open(std::path::Path::new(&path)).unwrap());
+        let idx = LineIndex::new(src.len());
+        let t = std::time::Instant::now();
+        crate::indexer::spawn_indexer(src.clone(), idx.clone(), Encoding::Utf8, egui::Context::default())
+            .join()
+            .unwrap();
+        let rows = idx.line_count().saturating_sub(1);
+        eprintln!("index: {} rows in {:?}", rows, t.elapsed());
+
+        let run = |label: &str, filters: &[(usize, ColumnFilter)]| {
+            let t = std::time::Instant::now();
+            let m = apply_filters(&src, &idx, Encoding::Utf8, b',', filters, 1, None);
+            eprintln!("{label}: {} rows matched in {:?}", m.len(), t.elapsed());
+        };
+        run("contains(col1 'seoul')", &[(1, contains("seoul"))]);
+        run("range(col2 >= 9000)", &[(2, range(Some(9000.0), None))]);
+        run("contains + range", &[(1, contains("seoul")), (2, range(Some(9000.0), None))]);
+        let set: HashSet<String> = ["Busan", "Daegu"].iter().map(|s| s.to_string()).collect();
+        run("included(col1 2 values)", &[(1, ColumnFilter { included: Some(set), ..Default::default() })]);
+        let t = std::time::Instant::now();
+        let d = extract_distinct(&src, &idx, Encoding::Utf8, b',', 1, 1, None);
+        eprintln!("distinct(col1): {} values ({:?}) in {:?}", d.values.len(), d.count, t.elapsed());
+        let t = std::time::Instant::now();
+        let d = extract_distinct(&src, &idx, Encoding::Utf8, b',', 0, 1, None);
+        eprintln!("distinct(col0 all-unique): truncated={} ({:?}) in {:?}", d.truncated, d.count, t.elapsed());
+    }
+
     #[test]
     fn distinct_counts_values() {
         let (src, idx) = open_indexed(b"a\nb\na\nc\na\n");
@@ -703,7 +915,7 @@ mod tests {
         let (src, idx) = open_indexed(b"apple\nbanana\ncherry\napple\n");
         let mut included = HashSet::new();
         included.insert("apple".to_string());
-        let f = ColumnFilter { contains: String::new(), included: Some(included) };
+        let f = ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None };
         let matched = apply_filters(&src, &idx, Encoding::Utf8, b',', &[(0, f)], 0, None);
         assert_eq!(matched, vec![0, 3]);
     }
@@ -711,7 +923,7 @@ mod tests {
     #[test]
     fn filter_by_contains_case_insensitive() {
         let (src, idx) = open_indexed(b"Apple\nbanana\nPineapple\n");
-        let f = ColumnFilter { contains: "APP".to_string(), included: None };
+        let f = ColumnFilter { contains: "APP".to_string(), included: None, min: None, max: None };
         let matched = apply_filters(&src, &idx, Encoding::Utf8, b',', &[(0, f)], 0, None);
         assert_eq!(matched, vec![0, 2]);
     }
@@ -722,8 +934,8 @@ mod tests {
         let (src, idx) = open_indexed(b"A,10\nA,20\nB,10\n");
         let mut included = HashSet::new();
         included.insert("A".to_string());
-        let f0 = ColumnFilter { contains: String::new(), included: Some(included) };
-        let f1 = ColumnFilter { contains: "10".to_string(), included: None };
+        let f0 = ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None };
+        let f1 = ColumnFilter { contains: "10".to_string(), included: None, min: None, max: None };
         let matched = apply_filters(&src, &idx, Encoding::Utf8, b',', &[(0, f0), (1, f1)], 0, None);
         assert_eq!(matched, vec![0]);
     }
@@ -745,7 +957,7 @@ mod tests {
             .collect();
         let mut included = HashSet::new();
         included.insert("apple".to_string());
-        let f = ColumnFilter { contains: String::new(), included: Some(included) };
+        let f = ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None };
         let matched = apply_filters_lines(&lines, &[(0, f)], b',', 0);
         assert_eq!(matched, vec![0, 3]);
     }
@@ -754,7 +966,7 @@ mod tests {
     fn apply_filters_lines_contains_case_insensitive() {
         let lines: Vec<String> =
             ["Apple", "banana", "Pineapple"].iter().map(|s| s.to_string()).collect();
-        let f = ColumnFilter { contains: "APP".to_string(), included: None };
+        let f = ColumnFilter { contains: "APP".to_string(), included: None, min: None, max: None };
         let matched = apply_filters_lines(&lines, &[(0, f)], b',', 0);
         assert_eq!(matched, vec![0, 2]);
     }
@@ -765,7 +977,7 @@ mod tests {
             ["name", "a", "b", "a"].iter().map(|s| s.to_string()).collect();
         let mut included = HashSet::new();
         included.insert("a".to_string());
-        let f = ColumnFilter { contains: String::new(), included: Some(included) };
+        let f = ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None };
         let matched = apply_filters_lines(&lines, &[(0, f)], b',', 1);
         assert_eq!(matched, vec![1, 3]);
     }

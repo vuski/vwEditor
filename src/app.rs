@@ -1,4 +1,3 @@
-use crate::archive;
 use crate::index::LineIndex;
 use crate::indexer;
 use crate::parse::{self, Encoding, SeparatorMode};
@@ -263,6 +262,11 @@ pub struct Document {
     /// 매 프레임 공짜), Apply를 누르면 이 텍스트가 그대로 "포함" 행 필터
     /// 조건(`ColumnFilter::contains`)이 된다.
     pub filter_menu_search: String,
+    /// 드롭다운의 숫자 범위 입력란(최소/최대). 문자열로 들고 있다가 Apply에서
+    /// 파싱한다 — 타이핑 도중의 `-`나 `1.` 같은 미완성 입력을 그대로 두기
+    /// 위해서다. 비어 있으면 그쪽 경계 없음.
+    pub filter_menu_min: String,
+    pub filter_menu_max: String,
     /// 드롭다운에 보여줄 고유값 목록의 백그라운드 추출 작업.
     pub distinct_job: Option<crate::filter::DistinctJob>,
     /// 위 작업이 끝나 채워진 결과.
@@ -632,13 +636,6 @@ impl App {
             self.open_path_parquet(path);
             return;
         }
-        // zip도 매직(`PK\x03\x04`/`PK\x05\x06`)으로 판단한다 — `.csv.zip`이 아닌
-        // 다른 확장자로 저장된 zip도 열리고, 반대로 확장자만 `.zip`인 텍스트는
-        // 아래 텍스트 경로로 간다.
-        if archive::is_zip(&head) {
-            self.open_path_zip(path, ctx);
-            return;
-        }
         match parse::detect_text(&head) {
             parse::TextDetection::Binary => {
                 self.pending_binary_open = Some(PendingBinaryOpen {
@@ -674,70 +671,9 @@ impl App {
         );
     }
 
-    /// zip 파일을 연다. 안에서 표 형식 파일(csv/tsv/psv/txt) 하나를 찾아 통째로
-    /// 압축을 풀고, 그 바이트를 일반 텍스트 문서처럼 연다. 큰 파일도 전체를
-    /// 메모리에 올린 뒤 mmap 문서와 같은 인덱서를 타므로 결이 다르지 않다 —
-    /// 다만 압축 안 데이터는 mmap이 불가능하므로 이 경로만 램에 다 올린다.
-    /// 후보가 0개거나 2개 이상이면(`extract_single_table` 참조) `self.error`를
-    /// 채우고 탭은 추가하지 않는다 — `open_path_as_text`와 같은 규율.
-    pub fn open_path_zip(&mut self, path: &Path, ctx: &egui::Context) {
-        self.error = None;
-        let entry = match archive::extract_single_table(path) {
-            Ok(e) => e,
-            Err(e) => {
-                self.error = Some(e);
-                return;
-            }
-        };
-        let head = {
-            let n = entry.bytes.len().min(PRIME_BYTES);
-            &entry.bytes[..n]
-        };
-        // 표 확장자(csv/tsv/psv/txt)인데 내용이 바이너리로 보이는 경우는
-        // 드물다고 보고 UTF-8로 강제한다 — zip 안 파일은 `pending_binary_open`의
-        // "이 인코딩으로 다시 열기" 흐름을 태울 대상 경로가 없다(디스크 파일이
-        // 아니라 압축 해제된 바이트라서).
-        let enc = match parse::detect_text(head) {
-            parse::TextDetection::Binary => Encoding::Utf8,
-            parse::TextDetection::Text(enc) => enc,
-        };
-        let path_label = format!("{} → {}", path.display(), entry.name);
-        let entry_name = std::path::PathBuf::from(&entry.name);
-        self.open_zip_entry_as_text(entry.bytes, enc, &entry_name, path_label, ctx);
-    }
-
-    /// zip 안에서 꺼낸 바이트를 텍스트 문서로 연다(읽기 전용 원본 없음).
-    /// `open_path_as_text`와 같은 뒷단(`finish_open_text`)을 타므로 인덱싱·
-    /// 자동 편집 모드 진입이 동일하게 적용된다. 디스크에 대응하는 파일이
-    /// 없으므로 `path`는 빈 경로 — 저장하면 "다른 이름으로 저장"으로
-    /// 폴백한다(`build_extracted_doc` 주석과 같은 규율). 구분자 감지는
-    /// 저장 경로가 아니라 zip 안 항목 이름(`entry_name`)의 확장자를 본다 —
-    /// 이래야 `data.csv`가 zip 밖에서 연 것과 똑같이 콤마로 감지된다.
-    pub fn open_zip_entry_as_text(
-        &mut self,
-        bytes: Vec<u8>,
-        enc: Encoding,
-        entry_name: &Path,
-        path_label: String,
-        ctx: &egui::Context,
-    ) {
-        self.error = None;
-        let src = Arc::new(Source::from_bytes(bytes));
-        self.finish_open_text(
-            src,
-            enc,
-            std::path::PathBuf::new(),
-            path_label,
-            entry_name.to_path_buf(),
-            true,
-            ctx,
-        );
-    }
-
-    /// `open_path_as_text`/`open_zip_entry_as_text` 공통 뒷단: 구분자·헤더
-    /// 감지, 인덱서 기동, `Document` 생성·추가, 작은 파일 자동 편집 모드 진입.
-    /// `sep_hint_path`는 구분자 확장자 감지에만 쓰인다 — 저장 시 갈 실제
-    /// 경로(`path`)와 다를 수 있다(zip 항목처럼).
+    /// `open_path_as_text` 뒷단: 구분자·헤더 감지, 인덱서 기동, `Document`
+    /// 생성·추가, 작은 파일 자동 편집 모드 진입. `sep_hint_path`는 구분자
+    /// 확장자 감지에만 쓰인다 — 저장 시 갈 실제 경로(`path`)와 다를 수 있다.
     fn finish_open_text(
         &mut self,
         src: Arc<Source>,
@@ -848,6 +784,8 @@ impl App {
             filter_menu_anchor: None,
             filter_menu_included: None,
             filter_menu_search: String::new(),
+        filter_menu_min: String::new(),
+        filter_menu_max: String::new(),
             distinct_job: None,
             distinct_values: None,
             distinct_values_col: None,
@@ -1690,7 +1628,6 @@ impl eframe::App for App {
                             .add_filter("CSV", &["csv"])
                             .add_filter("TSV", &["tsv", "tab"])
                             .add_filter("Text", &["txt"])
-                            .add_filter("Zip", &["zip"])
                             .add_filter("All files", &["*"]);
                         if let Some(path) = dlg.pick_file() {
                             // 새 탭으로 열리므로 기존 탭을 대체하지 않는다 —
@@ -2303,7 +2240,7 @@ impl eframe::App for App {
         // 컬럼 자동필터 드롭다운(헤더의 ▾ 아이콘을 눌렀을 때만).
         if let Some(doc) = self.doc_mut() {
             if doc.open_filter_menu.is_some() {
-                render_filter_dialog(ctx, doc, col_base);
+                render_filter_dialog(ctx, doc, col_base, lang);
             }
         }
 
@@ -2885,6 +2822,106 @@ fn apply_page_scroll(doc: &mut Document, dir: PageDir) {
 /// `style.scroll_animation`/`ScrollAnimation`도 **없다**(레지스트리 소스 확인).
 /// 그래서 이 버전에서 즉시 점프를 얻는 길은 offset 직접 지정뿐이다.
 ///
+/// 뷰포트 오른쪽에 남겨 둘 세로 스크롤바 여백 폭(`pinned_vscrollbar`가 그 안에
+/// 그린다). egui 기본 스크롤바와 같은 치수를 쓴다.
+fn vscrollbar_gutter(ui: &egui::Ui) -> f32 {
+    let s = &ui.spacing().scroll;
+    s.bar_width + s.bar_inner_margin + s.bar_outer_margin
+}
+
+/// `TableBuilder`가 안쪽에 만드는 세로 `ScrollArea`의 상태 id.
+///
+/// egui_extras 0.28의 `Table::body`는 `ScrollArea::new([false, vscroll])`을
+/// **id_source 없이** 만들고(`table.rs:678`), `ScrollArea`는 그 경우
+/// `ui.make_persistent_id(Id::new("scroll_area"))`를 id로 쓴다
+/// (`scroll_area.rs:502-503`). `TableBuilder::new(ui)`가 받은 바로 그 `ui`에서
+/// 만들므로, 같은 `ui`로 이 값을 계산하면 일치한다. 크레이트를 올려 규칙이
+/// 바뀌면 `table_scroll_area_id_matches_egui_extras` 테스트가 깨져 알려준다.
+fn table_scroll_area_id(ui: &egui::Ui) -> egui::Id {
+    ui.make_persistent_id(egui::Id::new("scroll_area"))
+}
+
+/// 뷰포트 오른쪽 `bar_rect`에 세로 스크롤바를 직접 그리고, 드래그/클릭을
+/// `scroll_id`로 지정한 안쪽 `ScrollArea`의 offset에 써넣는다.
+///
+/// **왜 직접 그리는가.** 표는 `ScrollArea::horizontal` 안에 `TableBuilder`가
+/// 들어 있는 구조다(`TableBuilder`가 가로 스크롤을 지원하지 않고, 헤더를
+/// 세로 스크롤 밖에 두므로 바깥을 양방향으로 바꾸면 헤더가 같이 올라간다).
+/// 그러면 안쪽 세로 스크롤바는 **표 내용의 오른쪽 끝**에 붙어, 컬럼이 많은
+/// 파일에서는 가로로 끝까지 밀어야만 보인다. 그래서 안쪽 것은 숨기고
+/// (`ScrollBarVisibility::AlwaysHidden`) 뷰포트에 고정된 자리에 하나를 그린다.
+///
+/// 휠·Page Up/Down·찾기 점프 같은 세로 이동은 안쪽 `ScrollArea`가 그대로
+/// 처리한다(그쪽 offset을 읽어 엄지 위치를 그리므로 저절로 따라온다). 이
+/// 함수가 담당하는 것은 엄지 드래그와 트랙 클릭뿐이다.
+///
+/// `content_h`/`viewport_h`는 본문(헤더 제외) 기준이다 — 행 높이 계산은
+/// `scroll_offset_for_row`와 같은 `row_h + spacing_y` 배수를 쓴다.
+fn pinned_vscrollbar(
+    ui: &mut egui::Ui,
+    bar_rect: egui::Rect,
+    scroll_id: Option<egui::Id>,
+    content_h: f32,
+    viewport_h: f32,
+) {
+    let Some(scroll_id) = scroll_id else { return };
+    if content_h <= viewport_h || bar_rect.height() <= 0.0 {
+        return;
+    }
+    let ctx = ui.ctx().clone();
+    let mut state = egui::scroll_area::State::load(&ctx, scroll_id).unwrap_or_default();
+    let max_off = content_h - viewport_h;
+    let offset = state.offset.y.clamp(0.0, max_off);
+
+    let (bar_w, min_len, outer) = {
+        let s = &ui.spacing().scroll;
+        (s.bar_width, s.handle_min_length, s.bar_outer_margin)
+    };
+    let track = egui::Rect::from_min_max(
+        egui::pos2(bar_rect.right() - outer - bar_w, bar_rect.top()),
+        egui::pos2(bar_rect.right() - outer, bar_rect.bottom()),
+    );
+    let thumb_len = (viewport_h / content_h * track.height())
+        .clamp(min_len.min(track.height()), track.height());
+    let travel = (track.height() - thumb_len).max(0.0);
+    let thumb_top = track.top() + if max_off > 0.0 { offset / max_off * travel } else { 0.0 };
+    let thumb = egui::Rect::from_min_size(egui::pos2(track.left(), thumb_top), egui::vec2(bar_w, thumb_len));
+
+    let id = ui.id().with("pinned_vscrollbar");
+    let resp = ui.interact(bar_rect, id, egui::Sense::click_and_drag());
+    // 잡은 지점(엄지 위쪽에서 포인터까지)을 드래그 동안 유지한다 — 안 그러면
+    // 엄지 가장자리를 잡았을 때 첫 프레임에 엄지가 포인터 중앙으로 튄다.
+    // 트랙(엄지 밖)을 눌렀으면 엄지 중앙이 포인터로 오게 한다.
+    let grab_id = id.with("grab");
+    if resp.drag_started() || resp.clicked() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let grab = if thumb.contains(p) { p.y - thumb.top() } else { thumb_len * 0.5 };
+            ui.data_mut(|d| d.insert_temp(grab_id, grab));
+        }
+    }
+    if (resp.dragged() || resp.clicked()) && travel > 0.0 {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let grab: f32 = ui.data(|d| d.get_temp(grab_id)).unwrap_or(thumb_len * 0.5);
+            let frac = ((p.y - grab - track.top()) / travel).clamp(0.0, 1.0);
+            state.offset.y = frac * max_off;
+            state.store(&ctx, scroll_id);
+            ctx.request_repaint();
+        }
+    }
+
+    let v = ui.visuals();
+    let thumb_col = if resp.dragged() {
+        v.widgets.active.bg_fill
+    } else if resp.hovered() {
+        v.widgets.hovered.bg_fill
+    } else {
+        v.widgets.inactive.bg_fill
+    };
+    let painter = ui.painter();
+    painter.rect_filled(track, bar_w * 0.5, v.extreme_bg_color);
+    painter.rect_filled(thumb, bar_w * 0.5, thumb_col);
+}
+
 /// **행 → y 좌표.** `TableBody::rows`가 쓰는 것과 **같은** 식이다
 /// (`egui_extras-0.28.1/src/table.rs:969-988`): 행 하나가 차지하는 높이는
 /// `row_height + item_spacing.y`이고, `row`번째 행의 위쪽 y는 그 값의 배수다.
@@ -4599,6 +4636,8 @@ fn build_extracted_doc(
         filter_menu_anchor: None,
         filter_menu_included: None,
         filter_menu_search: String::new(),
+        filter_menu_min: String::new(),
+        filter_menu_max: String::new(),
         distinct_job: None,
         distinct_values: None,
         distinct_values_col: None,
@@ -4667,6 +4706,8 @@ fn hex_document(source: Arc<Source>, path: &Path) -> Document {
         filter_menu_anchor: None,
         filter_menu_included: None,
         filter_menu_search: String::new(),
+        filter_menu_min: String::new(),
+        filter_menu_max: String::new(),
         distinct_job: None,
         distinct_values: None,
         distinct_values_col: None,
@@ -4749,6 +4790,8 @@ fn parquet_document(
         filter_menu_anchor: None,
         filter_menu_included: None,
         filter_menu_search: String::new(),
+        filter_menu_min: String::new(),
+        filter_menu_max: String::new(),
         distinct_job: None,
         distinct_values: None,
         distinct_values_col: None,
@@ -6412,7 +6455,8 @@ fn recompute_view_auto(doc: &mut Document, delim: u8, data_start: usize, ctx: eg
 /// `egui_extras` 헤더 셀 클로저 안에서는(그 클로저가 `doc`을 불변으로만
 /// 빌리는 제약 때문에) 실시간 체크박스·텍스트 편집을 직접 그릴 수 없다는
 /// 구조적 제약도 피한다(`render_table`의 `clicked_col` 채널과 같은 사정).
-fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) {
+fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize, lang: crate::i18n::Lang) {
+    let s = crate::i18n::t(lang);
     let Some(col) = doc.open_filter_menu else { return };
     let delim = match doc.sep {
         SeparatorMode::Char(d) => d,
@@ -6438,10 +6482,11 @@ fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize
     };
     let title = {
         let n = col + col_base;
-        match &header_fields {
-            Some(h) => format!("Filter — {} {}", n, h.get(col).cloned().unwrap_or_default()),
-            None => format!("Filter — Column {n}"),
-        }
+        let what = match &header_fields {
+            Some(h) => format!("{} {}", n, h.get(col).cloned().unwrap_or_default()),
+            None => s.filter_column_n.replace("{}", &n.to_string()),
+        };
+        s.filter_title.replace("{}", &what)
     };
 
     let mut open = true;
@@ -6469,8 +6514,21 @@ fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize
             // 텍스트가 그대로 "포함" 행 필터 조건이 된다. 값 목록이 너무 커서
             // 잘린 컬럼(`truncated`)에서도, 체크박스에 없는 값까지 이 텍스트
             // 하나로 걸러낼 수 있다.
-            ui.label(crate::theme::chrome_text("Search / contains:"));
+            ui.label(crate::theme::chrome_text(s.filter_search));
             ui.text_edit_singleline(&mut doc.filter_menu_search);
+
+            // 숫자 범위. 비워 두면 그쪽 경계 없음. 숫자로 읽히지 않는 입력은
+            // 옆에 표시만 하고 Apply에서 무시한다(`parse_number`).
+            ui.label(crate::theme::chrome_text(s.filter_number_range));
+            ui.horizontal(|ui| {
+                let bad = |t: &str| !t.trim().is_empty() && crate::filter::parse_number(t).is_none();
+                ui.add(egui::TextEdit::singleline(&mut doc.filter_menu_min).desired_width(90.0).hint_text("min"));
+                ui.label("~");
+                ui.add(egui::TextEdit::singleline(&mut doc.filter_menu_max).desired_width(90.0).hint_text("max"));
+                if bad(&doc.filter_menu_min) || bad(&doc.filter_menu_max) {
+                    ui.label(crate::theme::chrome_text(s.filter_invalid_number));
+                }
+            });
 
             if let Some(job) = &doc.distinct_job {
                 let p = job.progress();
@@ -6485,28 +6543,31 @@ fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize
                 // (`DistinctCount` 주석 참조). 근사치는 "약"을 붙여 정확한 값과
                 // 헷갈리지 않게 한다.
                 let count_text = match result.count {
-                    crate::filter::DistinctCount::Exact(n) => format!("{n} distinct values"),
-                    crate::filter::DistinctCount::Approx(n) => format!("~{n} distinct values (estimated)"),
+                    crate::filter::DistinctCount::Exact(n) => s.filter_distinct_n.replace("{}", &n.to_string()),
+                    crate::filter::DistinctCount::Approx(n) => s.filter_distinct_est.replace("{}", &n.to_string()),
                 };
                 ui.label(crate::theme::chrome_text(count_text));
                 if result.truncated {
-                    ui.label(crate::theme::chrome_text(format!(
-                        "Too many distinct values — showing first {}. Use the text filter above to narrow down.",
-                        crate::filter::MAX_DISTINCT_VALUES
-                    )));
+                    ui.label(crate::theme::chrome_text(
+                        s.filter_truncated.replace("{}", &crate::filter::MAX_DISTINCT_VALUES.to_string()),
+                    ));
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Select All").clicked() {
+                    if ui.button(s.filter_select_all).clicked() {
                         doc.filter_menu_included = None;
                     }
-                    if ui.button("Clear All").clicked() {
+                    if ui.button(s.filter_clear_all).clicked() {
                         doc.filter_menu_included = Some(std::collections::HashSet::new());
                     }
                 });
-                let search_lower = doc.filter_menu_search.to_lowercase();
+                // 목록 좁히기는 행 필터와 같은 규칙(`find_ci_ascii`)을 쓴다 — 여기서
+                // 보이는 값이 Apply 뒤 실제로 잡히는 값과 어긋나면 안 된다.
+                let search_lower = doc.filter_menu_search.trim().to_ascii_lowercase().into_bytes();
                 egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                     for (value, count) in &result.values {
-                        if !search_lower.is_empty() && !value.to_lowercase().contains(&search_lower) {
+                        if !search_lower.is_empty()
+                            && crate::find::find_ci_ascii(value.as_bytes(), &search_lower).is_none()
+                        {
                             continue;
                         }
                         let mut checked = match &doc.filter_menu_included {
@@ -6514,7 +6575,7 @@ fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize
                             Some(set) => set.contains(value),
                         };
                         let label = if value.is_empty() {
-                            format!("(blank) ({count})")
+                            format!("{} ({count})", s.filter_blank)
                         } else {
                             format!("{value} ({count})")
                         };
@@ -6537,18 +6598,18 @@ fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize
                     }
                 });
             } else {
-                ui.label(crate::theme::chrome_text("Scanning…"));
+                ui.label(crate::theme::chrome_text(s.filter_scanning));
             }
 
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Apply").clicked() {
+                if ui.button(s.filter_apply).clicked() {
                     do_apply = true;
                 }
-                if ui.button("Clear Filter").clicked() {
+                if ui.button(s.filter_clear).clicked() {
                     do_clear = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(s.common_cancel).clicked() {
                     doc.open_filter_menu = None;
                 }
             });
@@ -6566,6 +6627,8 @@ fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize
         let f = crate::filter::ColumnFilter {
             contains: doc.filter_menu_search.trim().to_string(),
             included: doc.filter_menu_included.clone(),
+            min: crate::filter::parse_number(&doc.filter_menu_min),
+            max: crate::filter::parse_number(&doc.filter_menu_max),
         };
         if f.is_noop() {
             doc.column_filters.remove(&col);
@@ -7351,13 +7414,29 @@ fn render_table(
     // `ScrollArea`를 한 겹 더 씌운다. 컬럼이 `Column::initial`(고정폭)이라
     // 표의 실제 폭이 뷰포트 폭에 매이지 않으므로, 세로는 안쪽 TableBuilder가
     // 그대로 담당하고 가로만 바깥 ScrollArea가 담당해도 서로 간섭하지 않는다.
+    //
+    // 세로 스크롤바는 안쪽 TableBuilder 것을 숨기고 뷰포트 오른쪽 여백에 직접
+    // 그린다(`pinned_vscrollbar` 주석) — 그래야 가로로 어디에 있든 항상 보인다.
+    let full = ui.available_rect_before_wrap();
+    let gutter = vscrollbar_gutter(ui);
+    let table_rect =
+        egui::Rect::from_min_max(full.min, egui::pos2(full.right() - gutter, full.bottom()));
+    // 스크롤바는 헤더 한 줄 아래(본문 구간)만 차지한다.
+    let bar_rect = egui::Rect::from_min_max(
+        egui::pos2(table_rect.right(), full.top() + row_h + spacing_y),
+        full.max,
+    );
+    let inner_scroll_id: Cell<Option<egui::Id>> = Cell::new(None);
+    ui.allocate_ui_at_rect(table_rect, |ui| {
     egui::ScrollArea::horizontal()
         .id_source("render_table_hscroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+    inner_scroll_id.set(Some(table_scroll_area_id(ui)));
     let mut table = TableBuilder::new(ui)
         .striped(true)
         .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .max_scroll_height(avail_height)
         .column(Column::initial(64.0).at_least(48.0).resizable(true)) // 라인번호 #
         .columns(Column::initial(120.0).at_least(60.0).resizable(true), col_count);
@@ -7726,6 +7805,14 @@ fn render_table(
             });
         });
         });
+    });
+    pinned_vscrollbar(
+        ui,
+        bar_rect,
+        inner_scroll_id.get(),
+        view_row_count as f32 * (row_h + spacing_y),
+        bar_rect.height(),
+    );
 
     // Page Up/Down이 읽을 "지금 보고 있는 자리". **아래의 `if !editing { return }`
     // 보다 먼저** 기록해야 한다 — 뷰 모드에서도 페이지 이동은 되어야 하는데,
@@ -7766,6 +7853,8 @@ fn render_table(
             // 열었을 때 지난번 조건이 그대로 보이도록).
             doc.filter_menu_search = existing.contains;
             doc.filter_menu_included = existing.included;
+            doc.filter_menu_min = existing.min.map(|v| v.to_string()).unwrap_or_default();
+            doc.filter_menu_max = existing.max.map(|v| v.to_string()).unwrap_or_default();
             if doc.distinct_values_col != Some(c) {
                 doc.distinct_values_col = Some(c);
                 if let Some(e) = &doc.edit {
@@ -9238,13 +9327,24 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
     // 표 렌더와 같은 이유(`render_table`의 `ScrollArea::horizontal` 주석) —
     // `TableBuilder`가 가로 스크롤을 지원하지 않으므로 바깥에 한 겹 씌운다.
     // 확대 배율이 커지면 offset/hex/ascii 세 컬럼 합이 창 폭을 넘을 수 있다.
+    // 세로 스크롤바는 표 렌더와 같은 이유로 뷰포트 오른쪽에 직접 그린다
+    // (`pinned_vscrollbar` 주석). 헥스 뷰는 헤더가 없어 본문이 위부터다.
+    let full = ui.available_rect_before_wrap();
+    let gutter = vscrollbar_gutter(ui);
+    let table_rect =
+        egui::Rect::from_min_max(full.min, egui::pos2(full.right() - gutter, full.bottom()));
+    let bar_rect = egui::Rect::from_min_max(egui::pos2(table_rect.right(), full.top()), full.max);
+    let inner_scroll_id: Cell<Option<egui::Id>> = Cell::new(None);
+    ui.allocate_ui_at_rect(table_rect, |ui| {
     egui::ScrollArea::horizontal()
         .id_source("render_hex_hscroll")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+    inner_scroll_id.set(Some(table_scroll_area_id(ui)));
     let mut table = TableBuilder::new(ui)
         .striped(false)
         .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .max_scroll_height(avail_height)
         .column(Column::exact(offset_px))
         .column(Column::exact(hex_px))
@@ -9399,6 +9499,14 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
         });
     });
         });
+    });
+    pinned_vscrollbar(
+        ui,
+        bar_rect,
+        inner_scroll_id.get(),
+        total_rows as f32 * (row_h + spacing_y),
+        bar_rect.height(),
+    );
 
     // ---- 클로저 종료 → doc 가변 대여 가능 ----
 
@@ -10656,49 +10764,6 @@ mod tests {
     }
 
     // ---- Zip 배선 ----
-
-    #[test]
-    fn zip_with_a_single_csv_opens_as_a_text_document() {
-        let p = crate::archive::testutil::temp_path("openpath");
-        crate::archive::testutil::write_zip(&p, &[("data.csv", b"a,b\n1,2\n3,4\n")]);
-        let ctx = egui::Context::default();
-        let mut app = App::default();
-        app.open_path(&p, &ctx);
-        let doc = app.doc().expect("탭이 열려야 한다");
-        assert!(app.error.is_none(), "에러 없이 열려야 한다: {:?}", app.error);
-        assert_eq!(doc.sep, SeparatorMode::Char(b','), "zip 안 항목의 확장자로 구분자를 감지");
-        assert!(doc.has_header, "첫 논리 행이 컬럼 이름이다");
-        assert!(doc.path.as_os_str().is_empty(), "디스크에 대응하는 실제 파일이 없다");
-        assert!(doc.path_label.contains("data.csv"), "탭 라벨에 zip 안 파일 이름이 보여야 한다");
-        assert!(doc.is_extracted, "zip에서 꺼낸 문서는 추출본으로 표시한다");
-        std::fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn zip_with_no_csv_reports_an_error_without_opening_a_tab() {
-        let p = crate::archive::testutil::temp_path("noent");
-        crate::archive::testutil::write_zip(&p, &[("readme.md", b"hello")]);
-        let ctx = egui::Context::default();
-        let mut app = App::default();
-        app.open_path(&p, &ctx);
-        assert!(app.error.is_some(), "표 형식 파일이 없으면 에러");
-        assert!(app.doc().is_none(), "탭이 열리면 안 된다");
-        std::fs::remove_file(&p).ok();
-    }
-
-    #[test]
-    fn zip_with_multiple_csvs_reports_an_error_without_opening_a_tab() {
-        let p = crate::archive::testutil::temp_path("multi");
-        crate::archive::testutil::write_zip(&p, &[("a.csv", b"1"), ("b.csv", b"2")]);
-        let ctx = egui::Context::default();
-        let mut app = App::default();
-        app.open_path(&p, &ctx);
-        assert!(app.error.is_some(), "여러 후보면 에러");
-        assert!(app.doc().is_none(), "탭이 열리면 안 된다");
-        std::fs::remove_file(&p).ok();
-    }
-
-    // ---- Parquet 배선 ----
 
     #[test]
     fn parquet_file_opens_as_a_parquet_document() {
@@ -18430,6 +18495,76 @@ mod tests {
         );
     }
 
+    /// `table_scroll_area_id`가 계산한 id로 실제 `TableBuilder`의 세로
+    /// `ScrollArea` 상태가 읽혀야 한다. egui_extras/egui의 id 규칙이 바뀌면
+    /// 여기서 잡힌다 — 그러면 `pinned_vscrollbar`는 조용히 아무 일도 안 하게
+    /// 되므로(엄지가 안 그려짐) 이 테스트가 유일한 경보다.
+    #[test]
+    fn table_scroll_area_id_matches_egui_extras() {
+        use egui_extras::{Column, TableBuilder};
+        let ctx = egui::Context::default();
+        let mut found = false;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let id = table_scroll_area_id(ui);
+                TableBuilder::new(ui).column(Column::exact(40.0)).body(|body| {
+                    body.rows(20.0, 1000, |mut r| {
+                        r.col(|ui| {
+                            ui.label("x");
+                        });
+                    });
+                });
+                found = egui::scroll_area::State::load(ctx, id).is_some();
+            });
+        });
+        assert!(found, "안쪽 ScrollArea 상태가 예상한 id에 없다 — egui_extras id 규칙이 바뀌었나?");
+    }
+
+    /// `pinned_vscrollbar`가 트랙 클릭을 안쪽 ScrollArea offset으로 옮기는지.
+    /// 클릭 위치가 트랙 바닥이면 offset은 최대(content - viewport)여야 한다.
+    #[test]
+    fn pinned_vscrollbar_click_writes_inner_scroll_offset() {
+        let ctx = egui::Context::default();
+        let scroll_id = egui::Id::new("test_scroll");
+        let bar = egui::Rect::from_min_max(egui::pos2(190.0, 0.0), egui::pos2(200.0, 100.0));
+        // 1프레임: 위젯 등록(interact는 이전 프레임 rect를 기준으로 hit-test한다).
+        let frame = |ctx: &egui::Context, input: egui::RawInput| {
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    pinned_vscrollbar(ui, bar, Some(scroll_id), 1000.0, 100.0);
+                });
+            });
+        };
+        frame(&ctx, egui::RawInput::default());
+        let click_at = egui::pos2(195.0, 99.0);
+        let press = egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos: click_at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        frame(&ctx, press);
+        let release = egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos: click_at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            ..Default::default()
+        };
+        frame(&ctx, release);
+        let st = egui::scroll_area::State::load(&ctx, scroll_id).expect("offset이 저장돼야 한다");
+        assert!(
+            (st.offset.y - 900.0).abs() < 1.0,
+            "트랙 바닥 클릭 → 최대 offset(900) 근처여야 한다, got {}",
+            st.offset.y
+        );
+    }
+
     /// `scroll_offset_for_row`: 행 번호 → 세로 offset(px). 계산이
     /// `TableBody::rows`(`row_height + item_spacing.y` 배수)와 같아야 한다.
     #[test]
@@ -20155,7 +20290,7 @@ mod tests {
         included.insert("Seoul".to_string());
         doc.column_filters.insert(
             1,
-            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None },
         );
         recompute_view(doc, delim, data_start, ctx.clone());
         let matched = wait_filter_job(doc);
@@ -20214,7 +20349,7 @@ mod tests {
         included.insert("Seoul".to_string());
         doc.column_filters.insert(
             1,
-            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None },
         );
         recompute_view(doc, delim, data_start, ctx.clone());
         let matched = wait_filter_job(doc);
@@ -20243,7 +20378,7 @@ mod tests {
         included.insert("Seoul".to_string());
         doc.column_filters.insert(
             1,
-            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None },
         );
         doc.active_sort_specs = vec![SortSpec { col: 2, kind: SortKind::Number, dir: SortDir::Asc, ci: false }];
         recompute_view(doc, delim, data_start, ctx.clone());
@@ -20290,7 +20425,7 @@ mod tests {
         included.insert("Seoul".to_string());
         doc.column_filters.insert(
             1,
-            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None },
         );
         recompute_edit_view(doc, delim, data_start);
         assert_eq!(
@@ -20349,7 +20484,7 @@ mod tests {
         included.insert("Seoul".to_string());
         doc.column_filters.insert(
             1,
-            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included), min: None, max: None },
         );
         doc.active_sort_specs = vec![SortSpec { col: 2, kind: SortKind::Number, dir: SortDir::Asc, ci: false }];
         recompute_edit_view(doc, delim, data_start);
