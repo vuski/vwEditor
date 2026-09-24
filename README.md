@@ -143,6 +143,10 @@ cargo build --release
 이 프로그램을 수정해 배포하면 그 소스도 같은 GPL v3으로 공개해야 합니다.
 개인적으로 고쳐 쓰는 것은 자유입니다.
 
+## 기여자
+
+- [@greenoceanplanet](https://github.com/greenoceanplanet) — 표·헥스 뷰 가로 스크롤(#1), 컬럼별 자동 필터(#2)
+
 ---
 
 # vwEditor (English)
@@ -301,3 +305,7 @@ cargo build --release
 
 If you modify and distribute this program, you must release your source under
 the same GPL v3. Modifying it for your own private use is free.
+
+## Contributors
+
+- [@greenoceanplanet](https://github.com/greenoceanplanet) — horizontal scrolling for table and hex views (#1), per-column auto filter (#2)
