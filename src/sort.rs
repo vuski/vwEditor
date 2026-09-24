@@ -505,6 +505,48 @@ pub fn extract_and_multi_sort(
     keyed.into_iter().map(|(_, idx)| idx).collect()
 }
 
+/// `extract_and_multi_sort`의 부분집합 버전. 파일 전체(`data_start..total`)
+/// 대신 `rows`(논리 행번호 목록, 임의 순서)만 정렬 대상으로 삼는다 — 컬럼
+/// 필터가 걸린 뒤 "그 결과 안에서만 정렬"할 때 쓴다(엑셀에서 필터+정렬을
+/// 같이 쓰는 것과 같은 동작). 키 인코딩·정렬 로직은 `extract_and_multi_sort`와
+/// 완전히 같고, 순회 범위(`data_start..total` vs 임의의 `rows` 목록)만 다르다
+/// — 그래서 함수를 합치지 않고 따로 둔다(제어 흐름을 억지로 통일하면 오히려
+/// 어느 쪽 경로인지 읽기 어려워진다).
+pub fn extract_and_multi_sort_subset(
+    source: &Arc<Source>,
+    index: &LineIndex,
+    enc: Encoding,
+    delim: u8,
+    specs: &[SortSpec],
+    rows: &[u32],
+    progress: Option<&(dyn Fn(usize) + Sync)>,
+) -> Vec<u32> {
+    if rows.is_empty() || specs.is_empty() {
+        return Vec::new();
+    }
+    let (offsets, total_bytes) = index.snapshot();
+    let offsets: &[u64] = &offsets;
+    let bytes = source.as_bytes();
+
+    let mut keyed: Vec<([u64; MAX_KEYS], u32)> = vec![([0u64; MAX_KEYS], 0); rows.len()];
+    const CHUNK: usize = 64 * 1024;
+    keyed.par_chunks_mut(CHUNK).enumerate().for_each(|(ci, chunk)| {
+        let base = ci * CHUNK;
+        for (j, slot) in chunk.iter_mut().enumerate() {
+            let logical = rows[base + j] as usize;
+            let keys = multi_key_for_row(bytes, offsets, total_bytes, enc, delim, specs, logical);
+            *slot = (keys, rows[base + j]);
+        }
+        if let Some(p) = progress {
+            p(chunk.len());
+        }
+    });
+
+    keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    keyed.into_iter().map(|(_, idx)| idx).collect()
+}
+
 /// 한 행의 선택 컬럼에서 정렬 키를 추출한다(락 없는 hot path 버전).
 /// offsets 슬라이스와 전체 mmap 바이트를 직접 받아 RwLock을 잡지 않는다.
 /// 반환: (정렬 키, truncated). truncated=true면 필드가 PREFIX_LEN(8B)을 넘어
@@ -608,6 +650,30 @@ pub fn sort_lines(lines: &[String], specs: &[SortSpec], delim: u8, data_start: u
                 *slot = col_key(field, *spec);
             }
             (keys, logical as u32)
+        })
+        .collect();
+    keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    keyed.into_iter().map(|(_, idx)| idx).collect()
+}
+
+/// `sort_lines`의 부분집합 버전. 전체(`data_start..`) 대신 `rows`(논리
+/// 행번호 목록, 임의 순서)만 정렬 대상으로 삼는다 — 편집 모드에서 필터가
+/// 걸린 뒤 그 결과만(파일은 그대로 두고 **화면 표시 순서만**) 정렬할 때 쓴다.
+/// `extract_and_multi_sort_subset`(mmap 경로)의 인메모리 버전.
+pub fn sort_lines_subset(lines: &[String], specs: &[SortSpec], delim: u8, rows: &[u32]) -> Vec<u32> {
+    if rows.is_empty() || specs.is_empty() {
+        return Vec::new();
+    }
+    let mut keyed: Vec<([u64; MAX_KEYS], u32)> = rows
+        .par_iter()
+        .map(|&logical| {
+            let line = lines[logical as usize].as_bytes();
+            let mut keys = [0u64; MAX_KEYS];
+            for (slot, spec) in keys.iter_mut().zip(specs.iter()) {
+                let field = parse::field_slice(line, delim, spec.col);
+                *slot = col_key(field, *spec);
+            }
+            (keys, logical)
         })
         .collect();
     keyed.par_sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -1007,6 +1073,45 @@ mod tests {
         assert_eq!(perm, vec![0, 2, 1]);
     }
 
+    // ---- 부분집합 정렬(필터+정렬 조합용) ----
+
+    #[test]
+    fn subset_sort_only_orders_given_rows() {
+        // 원본: 0 "c", 1 "a", 2 "b", 3 "d". rows=[0,2,1] (3은 필터에서 빠짐)
+        // 문자 오름으로 정렬하면 a(1), b(2), c(0) → [1,2,0]. 3은 후보에도
+        // 없으니 결과에 나오면 안 된다.
+        let (src, idx) = open_indexed(b"c\na\nb\nd\n");
+        let specs = [spec(0, SortKind::Text, SortDir::Asc)];
+        let rows = [0u32, 2, 1];
+        let perm = extract_and_multi_sort_subset(&src, &idx, Encoding::Utf8, b',', &specs, &rows, None);
+        assert_eq!(perm, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn subset_sort_empty_rows_returns_empty() {
+        let (src, idx) = open_indexed(b"a\nb\n");
+        let specs = [spec(0, SortKind::Text, SortDir::Asc)];
+        let perm = extract_and_multi_sort_subset(&src, &idx, Encoding::Utf8, b',', &specs, &[], None);
+        assert!(perm.is_empty());
+    }
+
+    #[test]
+    fn subset_sort_matches_full_sort_when_rows_cover_everything() {
+        // rows가 파일 전체(데이터 행 전부)를 담으면 결과가 전체 정렬과 같아야
+        // 한다(회귀 — 부분집합 경로가 전체 경로와 같은 키 인코딩을 쓰는지).
+        let content = b"B,30\nA,20\nB,10\nA,40\n";
+        let (src, idx) = open_indexed(content);
+        let specs = [
+            spec(0, SortKind::Text, SortDir::Asc),
+            spec(1, SortKind::Number, SortDir::Asc),
+        ];
+        let full = extract_and_multi_sort(&src, &idx, Encoding::Utf8, b',', &specs, 0, None);
+        let all_rows: Vec<u32> = (0..4).collect();
+        let subset =
+            extract_and_multi_sort_subset(&src, &idx, Encoding::Utf8, b',', &specs, &all_rows, None);
+        assert_eq!(full, subset);
+    }
+
     #[test]
     fn multi_single_spec_matches_single_sort() {
         // 기준 1개면 단일 정렬과 동일 결과(회귀).
@@ -1124,5 +1229,22 @@ mod tests {
         let order = sort_lines(&lines, &specs, b',', 1);
         // apple(2), banana(1) → [2,1]
         assert_eq!(order, vec![2, 1]);
+    }
+
+    #[test]
+    fn sort_lines_subset_only_orders_given_rows() {
+        // 원본: 0 "c", 1 "a", 2 "b", 3 "d". rows=[0,2,1] (3은 대상 밖).
+        let lines = vec!["c".to_string(), "a".to_string(), "b".to_string(), "d".to_string()];
+        let specs = [spec(0, SortKind::Text, SortDir::Asc)];
+        let rows = [0u32, 2, 1];
+        let order = sort_lines_subset(&lines, &specs, b',', &rows);
+        assert_eq!(order, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn sort_lines_subset_empty_rows_is_empty() {
+        let lines = vec!["a".to_string()];
+        let specs = [spec(0, SortKind::Text, SortDir::Asc)];
+        assert!(sort_lines_subset(&lines, &specs, b',', &[]).is_empty());
     }
 }

@@ -43,8 +43,10 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod app;
+mod archive;
 mod convert;
 mod edit;
+mod filter;
 mod find;
 mod hex;
 mod i18n;

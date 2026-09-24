@@ -1,3 +1,4 @@
+use crate::archive;
 use crate::index::LineIndex;
 use crate::indexer;
 use crate::parse::{self, Encoding, SeparatorMode};
@@ -54,10 +55,19 @@ pub struct Document {
     pub custom_sep_input: String,
     /// 헤더 클릭으로 선택된 컬럼(표 모드에서만). 정렬 대상.
     pub selected_col: Option<usize>,
-    /// 현재 적용된 정렬. None이면 원본 순서.
+    /// 현재 적용된 정렬. None이면 원본 순서. **결과** 값이다 — 화살표 표시
+    /// 등에 쓰고, "무엇을 정렬할지"는 `active_sort_specs`가 따로 들고 있다.
     pub sort: Option<SortState>,
     /// 진행 중인 백그라운드 정렬 작업. 완료되면 sort로 옮기고 None이 된다.
     pub sort_job: Option<sort::SortJob>,
+    /// 지금 사용자가 걸어 둔 정렬 기준(의도). 비어 있으면 정렬 없음. `sort`가
+    /// "그 기준을 적용해 계산까지 끝난 결과"라면, 이건 그 계산의 **입력**이라
+    /// 필터가 나중에 바뀌어도(체크박스로 값 추가/제외 등) 무엇을 기준으로
+    /// 다시 정렬해야 하는지 알 수 있다. `recompute_view`가 이 값과
+    /// `column_filters`를 함께 보고 어떤 배경 작업을 띄울지 결정한다
+    /// (`recompute_view` 주석 참조 — 필터+정렬을 함께 쓸 때는 필터로 추린
+    /// 행들 안에서만 정렬하고, 필터가 없으면 파일 전체를 정렬한다).
+    pub active_sort_specs: Vec<SortSpec>,
     /// 다중 컬럼 정렬 다이얼로그 표시 여부.
     pub show_sort_dialog: bool,
     /// 구분자 변환 다이얼로그 표시 여부.
@@ -226,6 +236,40 @@ pub struct Document {
     /// `(컬럼, 방향)`. hex 모드의 `confirm_load`와 같은 방식이다 —
     /// 확인 전에는 정렬을 시작하지 않는다.
     pub pending_parquet_sort: Option<(usize, SortDir)>,
+
+    // ---- 컬럼 자동필터(엑셀 스타일) ----
+    /// 컬럼별 적용된 필터 조건. 조건이 없어진 컬럼은 여기서 제거한다(순회 비용이
+    /// 실제로 필터가 걸린 컬럼 수에만 비례하게 유지).
+    pub column_filters: std::collections::BTreeMap<usize, crate::filter::ColumnFilter>,
+    /// `column_filters`를 전체 데이터에 적용한 배경 작업의 결과. `column_filters`가
+    /// 비어 있을 때와 논리적으로는 같은 "필터 없음"이지만, "조건은 있는데 아직
+    /// 백그라운드 스캔이 안 끝났다" 구간을 구분하려고 별도로 둔다 — 그 구간에는
+    /// 이전 결과(있다면)를 계속 보여주고 진행률 바만 얹는다.
+    pub filter: Option<crate::filter::FilterState>,
+    /// 진행 중인 백그라운드 필터 적용 작업. 완료되면 `filter`로 옮기고 `None`.
+    pub filter_job: Option<crate::filter::FilterJob>,
+    /// 헤더에서 지금 열려 있는 필터 드롭다운의 컬럼. `None`이면 닫힘.
+    pub open_filter_menu: Option<usize>,
+    /// 드롭다운을 열 때 클릭한 필터 아이콘의 화면 좌표(왼쪽 아래 모서리).
+    /// `render_filter_dialog`가 창을 이 근처에 띄운다 — 없으면 `egui::Window`
+    /// 기본 위치(화면 좌상단)에 뜬다.
+    pub filter_menu_anchor: Option<egui::Pos2>,
+    /// 드롭다운 안에서 편집 중인 임시 조건 — 적용을 누르기 전까지는 실제
+    /// `column_filters`를 건드리지 않는다(취소 시 버림). 드롭다운을 열 때 그
+    /// 컬럼의 현재 조건으로 초기화한다.
+    pub filter_menu_included: Option<std::collections::HashSet<String>>,
+    /// 드롭다운의 검색창. 두 역할을 겸한다(엑셀 자동필터와 같은 동작) — 타이핑
+    /// 즉시 아래 체크박스 목록을 실시간으로 좁히고(화면 표시만 거르는 것이라
+    /// 매 프레임 공짜), Apply를 누르면 이 텍스트가 그대로 "포함" 행 필터
+    /// 조건(`ColumnFilter::contains`)이 된다.
+    pub filter_menu_search: String,
+    /// 드롭다운에 보여줄 고유값 목록의 백그라운드 추출 작업.
+    pub distinct_job: Option<crate::filter::DistinctJob>,
+    /// 위 작업이 끝나 채워진 결과.
+    pub distinct_values: Option<crate::filter::DistinctResult>,
+    /// `distinct_values`가 어느 컬럼 것인지. 드롭다운을 다른 컬럼으로 옮기면
+    /// 이 값과 비교해 다시 추출해야 함을 판단한다.
+    pub distinct_values_col: Option<usize>,
 }
 
 /// 확인 없이 바로 수행할 컬럼 연산의 최대 행 수. 이보다 크면 사용자에게 묻는다.
@@ -588,6 +632,13 @@ impl App {
             self.open_path_parquet(path);
             return;
         }
+        // zip도 매직(`PK\x03\x04`/`PK\x05\x06`)으로 판단한다 — `.csv.zip`이 아닌
+        // 다른 확장자로 저장된 zip도 열리고, 반대로 확장자만 `.zip`인 텍스트는
+        // 아래 텍스트 경로로 간다.
+        if archive::is_zip(&head) {
+            self.open_path_zip(path, ctx);
+            return;
+        }
         match parse::detect_text(&head) {
             parse::TextDetection::Binary => {
                 self.pending_binary_open = Some(PendingBinaryOpen {
@@ -612,7 +663,91 @@ impl App {
                 return;
             }
         };
+        self.finish_open_text(
+            src,
+            enc,
+            path.to_path_buf(),
+            path.display().to_string(),
+            path.to_path_buf(),
+            false,
+            ctx,
+        );
+    }
 
+    /// zip 파일을 연다. 안에서 표 형식 파일(csv/tsv/psv/txt) 하나를 찾아 통째로
+    /// 압축을 풀고, 그 바이트를 일반 텍스트 문서처럼 연다. 큰 파일도 전체를
+    /// 메모리에 올린 뒤 mmap 문서와 같은 인덱서를 타므로 결이 다르지 않다 —
+    /// 다만 압축 안 데이터는 mmap이 불가능하므로 이 경로만 램에 다 올린다.
+    /// 후보가 0개거나 2개 이상이면(`extract_single_table` 참조) `self.error`를
+    /// 채우고 탭은 추가하지 않는다 — `open_path_as_text`와 같은 규율.
+    pub fn open_path_zip(&mut self, path: &Path, ctx: &egui::Context) {
+        self.error = None;
+        let entry = match archive::extract_single_table(path) {
+            Ok(e) => e,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
+        };
+        let head = {
+            let n = entry.bytes.len().min(PRIME_BYTES);
+            &entry.bytes[..n]
+        };
+        // 표 확장자(csv/tsv/psv/txt)인데 내용이 바이너리로 보이는 경우는
+        // 드물다고 보고 UTF-8로 강제한다 — zip 안 파일은 `pending_binary_open`의
+        // "이 인코딩으로 다시 열기" 흐름을 태울 대상 경로가 없다(디스크 파일이
+        // 아니라 압축 해제된 바이트라서).
+        let enc = match parse::detect_text(head) {
+            parse::TextDetection::Binary => Encoding::Utf8,
+            parse::TextDetection::Text(enc) => enc,
+        };
+        let path_label = format!("{} → {}", path.display(), entry.name);
+        let entry_name = std::path::PathBuf::from(&entry.name);
+        self.open_zip_entry_as_text(entry.bytes, enc, &entry_name, path_label, ctx);
+    }
+
+    /// zip 안에서 꺼낸 바이트를 텍스트 문서로 연다(읽기 전용 원본 없음).
+    /// `open_path_as_text`와 같은 뒷단(`finish_open_text`)을 타므로 인덱싱·
+    /// 자동 편집 모드 진입이 동일하게 적용된다. 디스크에 대응하는 파일이
+    /// 없으므로 `path`는 빈 경로 — 저장하면 "다른 이름으로 저장"으로
+    /// 폴백한다(`build_extracted_doc` 주석과 같은 규율). 구분자 감지는
+    /// 저장 경로가 아니라 zip 안 항목 이름(`entry_name`)의 확장자를 본다 —
+    /// 이래야 `data.csv`가 zip 밖에서 연 것과 똑같이 콤마로 감지된다.
+    pub fn open_zip_entry_as_text(
+        &mut self,
+        bytes: Vec<u8>,
+        enc: Encoding,
+        entry_name: &Path,
+        path_label: String,
+        ctx: &egui::Context,
+    ) {
+        self.error = None;
+        let src = Arc::new(Source::from_bytes(bytes));
+        self.finish_open_text(
+            src,
+            enc,
+            std::path::PathBuf::new(),
+            path_label,
+            entry_name.to_path_buf(),
+            true,
+            ctx,
+        );
+    }
+
+    /// `open_path_as_text`/`open_zip_entry_as_text` 공통 뒷단: 구분자·헤더
+    /// 감지, 인덱서 기동, `Document` 생성·추가, 작은 파일 자동 편집 모드 진입.
+    /// `sep_hint_path`는 구분자 확장자 감지에만 쓰인다 — 저장 시 갈 실제
+    /// 경로(`path`)와 다를 수 있다(zip 항목처럼).
+    fn finish_open_text(
+        &mut self,
+        src: Arc<Source>,
+        enc: Encoding,
+        path: std::path::PathBuf,
+        path_label: String,
+        sep_hint_path: std::path::PathBuf,
+        is_extracted: bool,
+        ctx: &egui::Context,
+    ) {
         // `src`는 아래에서 `Document`로 옮겨 가므로 크기를 미리 잡아 둔다.
         let size = src.len();
 
@@ -624,7 +759,7 @@ impl App {
         // 앞부분을 줄 단위로 나눠 구분자/헤더 감지에 사용
         let head_text = parse::decode_line(head, enc);
         let head_lines: Vec<&str> = head_text.lines().take(50).collect();
-        let sep = parse::detect_separator(path, &head_lines);
+        let sep = parse::detect_separator(&sep_hint_path, &head_lines);
         // 헤더 감지는 표 모드일 때만 의미가 있다. 텍스트 모드면 헤더 없음.
         let has_header = match sep {
             SeparatorMode::Char(d) => {
@@ -655,13 +790,14 @@ impl App {
             sep,
             has_header,
             indexer: Some(handle),
-            path: path.to_path_buf(),
-            path_label: path.display().to_string(),
-            is_extracted: false,
+            path,
+            path_label,
+            is_extracted,
             custom_sep_input,
             selected_col: None,
             sort: None,
             sort_job: None,
+            active_sort_specs: Vec::new(),
             show_sort_dialog: false,
             show_convert_dialog: false,
             convert_target: None,
@@ -705,6 +841,16 @@ impl App {
             hex: None,
             parquet: None,
             pending_parquet_sort: None,
+            column_filters: std::collections::BTreeMap::new(),
+            filter: None,
+            filter_job: None,
+            open_filter_menu: None,
+            filter_menu_anchor: None,
+            filter_menu_included: None,
+            filter_menu_search: String::new(),
+            distinct_job: None,
+            distinct_values: None,
+            distinct_values_col: None,
         });
 
         // 작은 파일은 곧바로 편집 모드로. 뷰 모드로 열었다가 사용자가 메뉴에서
@@ -1240,9 +1386,26 @@ pub fn enter_edit_mode(doc: &mut Document) {
     }
     let buf = crate::edit::load_edit_buffer(&doc.source, doc.enc);
     doc.edit = Some(buf);
-    // 편집 모드에선 뷰 permutation 정렬을 폐기(이제 lines가 진실).
+    // 뷰 모드의 permutation 정렬/배경 작업은 폐기한다(이제 lines가 진실이고,
+    // 진행 중이었을 mmap 기반 작업 결과는 편집 버퍼와 무관해진다).
     doc.sort = None;
     doc.sort_job = None;
+    doc.filter_job = None;
+    // 컬럼 필터·정렬 "의도"(`column_filters`/`active_sort_specs`)는 지우지
+    // 않고 그대로 이어받는다 — `recompute_edit_view`가 편집 버퍼 기준으로
+    // 다시 계산한다(뷰 모드에서 걸어 둔 필터가 편집 모드 진입 직후에도 계속
+    // 유효하게). 필터가 mmap 원본 바이트가 아니라 이제 막 로드된 `e.lines`를
+    // 훑으므로, 이 시점엔 아직 편집 버퍼가 파일과 완전히 같아 결과도 같다.
+    let delim = match doc.sep {
+        SeparatorMode::Char(d) => Some(d),
+        SeparatorMode::None => None,
+    };
+    let data_start = if doc.has_header { 1 } else { 0 };
+    if let Some(delim) = delim {
+        recompute_edit_view(doc, delim, data_start);
+    } else {
+        doc.filter = None;
+    }
     doc.editing_cell = None;
     doc.cell_sel = None;
     doc.cell_drag_active = false;
@@ -1527,6 +1690,7 @@ impl eframe::App for App {
                             .add_filter("CSV", &["csv"])
                             .add_filter("TSV", &["tsv", "tab"])
                             .add_filter("Text", &["txt"])
+                            .add_filter("Zip", &["zip"])
                             .add_filter("All files", &["*"]);
                         if let Some(path) = dlg.pick_file() {
                             // 새 탭으로 열리므로 기존 탭을 대체하지 않는다 —
@@ -1933,7 +2097,7 @@ impl eframe::App for App {
                         Phase::Paused => {
                             ui.label(crate::theme::chrome_text(format!(
                                 "Stopped — showing first {} rows ({done_gb:.2} / {total_gb:.2} GB)",
-                                doc.index.line_count()
+                                crate::parquet::group_digits(doc.index.line_count() as u64)
                             )));
                             if ui.button(s.common_resume).clicked() {
                                 // 재개 = 처음부터 다시 병렬 스캔. spawn_indexer가
@@ -1957,7 +2121,7 @@ impl eframe::App for App {
                         Phase::Complete => {
                             ui.label(crate::theme::chrome_text(format!(
                                 "Ready — {} rows",
-                                doc.index.line_count()
+                                crate::parquet::group_digits(doc.index.line_count() as u64)
                             )));
                             // 정렬이 적용돼 있으면 어떤 기준인지 표시.
                             if let Some(s) = &doc.sort {
@@ -1991,7 +2155,7 @@ impl eframe::App for App {
                         ui.separator();
                         ui.label(crate::theme::chrome_text(format!(
                             "Editing — {} rows",
-                            e.lines.len()
+                            crate::parquet::group_digits(e.lines.len() as u64)
                         )));
                         if e.dirty {
                             ui.label(
@@ -1999,6 +2163,24 @@ impl eframe::App for App {
                                     .color(egui::Color32::from_rgb(200, 90, 20)),
                             );
                         }
+                    }
+                    // 필터 표시. 편집/일반 모드 공통 — `doc.filter`가 있으면
+                    // 실제로는 필터링된 부분집합만 보고 있다는 뜻인데, 위의
+                    // "Ready — N rows"/"Editing — N rows"는 필터 전 전체 행
+                    // 수라 그대로 두면 마치 전체를 보는 것처럼 오해하기 쉽다.
+                    if let Some(filter) = &doc.filter {
+                        let total_lines = doc_line_count(doc);
+                        let data_start = if doc.has_header { 1 } else { 0 };
+                        let total_rows = total_lines.saturating_sub(data_start);
+                        ui.separator();
+                        ui.label(
+                            crate::theme::chrome_text(format!(
+                                "Filtered — {} of {} rows",
+                                crate::parquet::group_digits(filter.matched.len() as u64),
+                                crate::parquet::group_digits(total_rows as u64)
+                            ))
+                            .color(egui::Color32::from_rgb(20, 110, 190)),
+                        );
                     }
                     // 파싱 오류 행 요약. 오류가 있으면 눌러서 창을 연다.
                     if let Some(text) = error_status_text(doc) {
@@ -2115,6 +2297,13 @@ impl eframe::App for App {
         if let Some(doc) = self.doc_mut() {
             if doc.show_sort_dialog {
                 render_sort_dialog(ctx, doc, col_base, lang);
+            }
+        }
+
+        // 컬럼 자동필터 드롭다운(헤더의 ▾ 아이콘을 눌렀을 때만).
+        if let Some(doc) = self.doc_mut() {
+            if doc.open_filter_menu.is_some() {
+                render_filter_dialog(ctx, doc, col_base);
             }
         }
 
@@ -3371,6 +3560,12 @@ fn sort_parquet_column(doc: &mut Document, col: usize, dir: SortDir) {
         dir,
         spec_count: 1,
     });
+    // 정렬·필터 상호 배타 규칙(`render_sort_controls` 주석 참조) — Parquet
+    // 정렬 경로도 예외가 아니다. 현재 컬럼 필터는 Parquet을 지원하지 않으므로
+    // (mmap 원본 바이트가 없다) 보통 이미 None이지만, 나중에 지원이 추가돼도
+    // 규칙이 그대로 지켜지도록 명시한다.
+    doc.filter = None;
+    doc.filter_job = None;
 }
 
 /// 정렬을 시작하기 전에 메모리 예상치를 확인한다. 임계 초과면 확인 플래그만
@@ -4351,6 +4546,7 @@ fn build_extracted_doc(
         selected_col: None,
         sort: None,
         sort_job: None,
+        active_sort_specs: Vec::new(),
         show_sort_dialog: false,
         show_convert_dialog: false,
         convert_target: None,
@@ -4396,6 +4592,16 @@ fn build_extracted_doc(
         hex: None,
         parquet: None,
         pending_parquet_sort: None,
+        column_filters: std::collections::BTreeMap::new(),
+        filter: None,
+        filter_job: None,
+        open_filter_menu: None,
+        filter_menu_anchor: None,
+        filter_menu_included: None,
+        filter_menu_search: String::new(),
+        distinct_job: None,
+        distinct_values: None,
+        distinct_values_col: None,
     }
 }
 
@@ -4417,6 +4623,7 @@ fn hex_document(source: Arc<Source>, path: &Path) -> Document {
         selected_col: None,
         sort: None,
         sort_job: None,
+        active_sort_specs: Vec::new(),
         show_sort_dialog: false,
         show_convert_dialog: false,
         convert_target: None,
@@ -4453,6 +4660,16 @@ fn hex_document(source: Arc<Source>, path: &Path) -> Document {
         hex: Some(crate::hex::HexState::new()),
         parquet: None,
         pending_parquet_sort: None,
+        column_filters: std::collections::BTreeMap::new(),
+        filter: None,
+        filter_job: None,
+        open_filter_menu: None,
+        filter_menu_anchor: None,
+        filter_menu_included: None,
+        filter_menu_search: String::new(),
+        distinct_job: None,
+        distinct_values: None,
+        distinct_values_col: None,
     }
 }
 
@@ -4488,6 +4705,7 @@ fn parquet_document(
         selected_col: None,
         sort: None,
         sort_job: None,
+        active_sort_specs: Vec::new(),
         show_sort_dialog: false,
         show_convert_dialog: false,
         convert_target: None,
@@ -4524,6 +4742,16 @@ fn parquet_document(
         hex: None,
         parquet: Some(std::cell::RefCell::new(pq)),
         pending_parquet_sort: None,
+        column_filters: std::collections::BTreeMap::new(),
+        filter: None,
+        filter_job: None,
+        open_filter_menu: None,
+        filter_menu_anchor: None,
+        filter_menu_included: None,
+        filter_menu_search: String::new(),
+        distinct_job: None,
+        distinct_values: None,
+        distinct_values_col: None,
     }
 }
 
@@ -6056,6 +6284,299 @@ fn render_errors_window(ctx: &egui::Context, doc: &mut Document, row_base: usize
     goto
 }
 
+/// `column_filters`(필터 조건, 의도) 또는 `active_sort_specs`(정렬 기준,
+/// 의도)가 바뀔 때마다 이 함수를 불러 실제 배경 작업을 다시 띄운다. 이 두
+/// "의도" 필드가 유일한 입력이고, 나머지(`doc.sort`/`doc.filter`/두 job
+/// 필드)는 전부 여기서 계산해내는 **결과**다 — 그래서 필터를 걸고 정렬하든,
+/// 정렬해 두고 나중에 필터를 걸든, 필터를 지운 뒤에도 정렬이 남아 있어야
+/// 하든, 트리거 지점마다 따로 계산 로직을 짤 필요 없이 이 한 곳만 정확하면
+/// 된다.
+///
+/// - 둘 다 없으면 원본 순서(`sort`/`filter` 모두 `None`).
+/// - 필터만 있으면 필터만 적용(`spawn_apply_filters`, 정렬 기준 없이).
+/// - 정렬만 있으면 파일 전체를 정렬(`spawn_multi_sort`, 기존 동작 그대로).
+/// - 둘 다 있으면 **필터로 추린 행들 안에서만 정렬**한다(엑셀에서 자동필터와
+///   정렬을 같이 쓰는 것과 같은 동작) — `spawn_apply_filters`에 정렬 기준을
+///   함께 넘겨 한 배경 작업이 필터 → 정렬을 순서대로 처리하게 한다. 이때도
+///   화면은 여전히 `doc.filter`(그 안에 이미 정렬된 순서가 담김)를 통해서만
+///   그려진다 — `render_table`의 permutation 선택 규칙(필터 우선)을 그대로
+///   써먹는 것이라 렌더 쪽은 손댈 게 없다.
+fn recompute_view(doc: &mut Document, delim: u8, data_start: usize, ctx: egui::Context) {
+    doc.sort_job = None;
+    doc.filter_job = None;
+
+    let has_filter = !doc.column_filters.is_empty();
+    let has_sort = !doc.active_sort_specs.is_empty();
+
+    if !has_filter && !has_sort {
+        doc.sort = None;
+        doc.filter = None;
+        return;
+    }
+
+    if has_filter {
+        doc.filter = None;
+        let filters: Vec<(usize, crate::filter::ColumnFilter)> =
+            doc.column_filters.iter().map(|(c, f)| (*c, f.clone())).collect();
+        doc.filter_job = Some(crate::filter::spawn_apply_filters(
+            doc.source.clone(),
+            doc.index.clone(),
+            doc.enc,
+            delim,
+            filters,
+            doc.active_sort_specs.clone(),
+            data_start,
+            ctx,
+        ));
+    } else {
+        doc.filter = None;
+        doc.sort_job = Some(sort::spawn_multi_sort(
+            doc.source.clone(),
+            doc.index.clone(),
+            doc.enc,
+            delim,
+            doc.active_sort_specs.clone(),
+            data_start,
+            ctx,
+        ));
+    }
+}
+
+/// `recompute_view`의 편집 모드 버전. 편집 모드는 이미 파일 전체를 메모리에
+/// 동기로 올려 둔 상태라(`enter_edit_mode` 주석) 배경 작업 없이 그 자리에서
+/// 계산한다.
+///
+/// 필터가 없으면 기존 그대로 `apply_edit_sort`가 `e.lines`를 **물리적으로**
+/// 재배열한다(undo 가능, 저장하면 그 순서가 실제 파일에 반영된다). 필터가
+/// 있으면 정렬은 **화면 표시 순서만** 바꾸고 `e.lines` 자체는 건드리지
+/// 않는다 — 필터링된 부분집합만 물리적으로 재배열한다는 건 "화면에 없는
+/// 행은 그대로 두고 보이는 행만 섞는다"는 뜻이라 물리적 순서라는 개념 자체가
+/// 애매해지고, undo도 "부분 재배열"을 표현할 방법이 없다. 그래서 필터가
+/// 걸린 동안의 정렬은 뷰 모드와 똑같이 `doc.filter`(비파괴적 permutation)로만
+/// 표현한다 — 필터를 지우면 그 표시용 순서는 사라지고, 그 시점에 정렬
+/// 기준이 남아 있었다면 위 필터-없음 분기로 다시 들어와 그제서야 물리적으로
+/// 재배열된다(`recompute_view`와 대칭).
+fn recompute_edit_view(doc: &mut Document, delim: u8, data_start: usize) {
+    doc.filter = None;
+    let has_filter = !doc.column_filters.is_empty();
+    let has_sort = !doc.active_sort_specs.is_empty();
+
+    if !has_filter && !has_sort {
+        return;
+    }
+
+    if !has_filter {
+        let specs = doc.active_sort_specs.clone();
+        apply_edit_sort(doc, &specs, delim, data_start);
+        return;
+    }
+
+    let filters: Vec<(usize, crate::filter::ColumnFilter)> =
+        doc.column_filters.iter().map(|(c, f)| (*c, f.clone())).collect();
+    let matched = {
+        let Some(e) = doc.edit.as_ref() else { return };
+        let m = crate::filter::apply_filters_lines(&e.lines, &filters, delim, data_start);
+        if has_sort {
+            sort::sort_lines_subset(&e.lines, &doc.active_sort_specs, delim, &m)
+        } else {
+            m
+        }
+    };
+    doc.filter = Some(crate::filter::FilterState { matched });
+    // 화살표 표시용(`recompute_view`의 filter_job 완료 처리와 같은 이유 —
+    // 실제 정렬 순서는 이미 `matched`에 반영돼 있고 이 `permutation`은 안 쓰인다).
+    doc.sort = doc.active_sort_specs.first().map(|first| SortState {
+        permutation: Vec::new(),
+        col: first.col,
+        kind: first.kind,
+        dir: first.dir,
+        spec_count: doc.active_sort_specs.len(),
+    });
+}
+
+/// `doc.edit`가 있으면(편집 모드) `recompute_edit_view`로, 없으면(뷰 모드)
+/// `recompute_view`로 보낸다. 트리거 지점마다("필터 적용", "정렬 버튼",
+/// "정렬 해제" 등) 이 분기를 반복해서 적지 않기 위한 얇은 래퍼.
+fn recompute_view_auto(doc: &mut Document, delim: u8, data_start: usize, ctx: egui::Context) {
+    if doc.edit.is_some() {
+        recompute_edit_view(doc, delim, data_start);
+    } else {
+        recompute_view(doc, delim, data_start, ctx);
+    }
+}
+
+/// 헤더의 ▾ 아이콘으로 여는 컬럼 자동필터 드롭다운(엑셀 자동필터 스타일).
+///
+/// 정확한 위치에 앵커된 팝업 대신 별도 `Window`로 띄운다 — 이 앱의 다른
+/// 다이얼로그(Sort by Columns, Convert 등)와 같은 패턴이라 낯설지 않고,
+/// `egui_extras` 헤더 셀 클로저 안에서는(그 클로저가 `doc`을 불변으로만
+/// 빌리는 제약 때문에) 실시간 체크박스·텍스트 편집을 직접 그릴 수 없다는
+/// 구조적 제약도 피한다(`render_table`의 `clicked_col` 채널과 같은 사정).
+fn render_filter_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize) {
+    let Some(col) = doc.open_filter_menu else { return };
+    let delim = match doc.sep {
+        SeparatorMode::Char(d) => d,
+        SeparatorMode::None => {
+            doc.open_filter_menu = None;
+            return;
+        }
+    };
+    let data_start = if doc.has_header { 1 } else { 0 };
+
+    // 고유값 스캔 작업이 끝났으면 결과를 거둔다.
+    if let Some(job) = &mut doc.distinct_job {
+        if let Some(result) = job.take_result() {
+            doc.distinct_values = Some(result);
+            doc.distinct_job = None;
+        }
+    }
+
+    let header_fields: Option<Vec<String>> = if doc.has_header {
+        parse_logical_line_edit(doc, 0, delim)
+    } else {
+        None
+    };
+    let title = {
+        let n = col + col_base;
+        match &header_fields {
+            Some(h) => format!("Filter — {} {}", n, h.get(col).cloned().unwrap_or_default()),
+            None => format!("Filter — Column {n}"),
+        }
+    };
+
+    let mut open = true;
+    let mut do_apply = false;
+    let mut do_clear = false;
+
+    let mut window = egui::Window::new(title)
+        .id(egui::Id::new(("filter_dropdown", col)))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(280.0);
+    // 클릭한 필터 아이콘 근처에 띄운다. `default_pos`는 이 창 id로 처음 열릴
+    // 때만 적용되고, 사용자가 드래그해 옮겨두면 다음에 같은 컬럼을 열 때는
+    // 그 위치를 기억한다(egui가 창 id별로 위치를 들고 있음) — 매 프레임
+    // 강제로 고정하는 `current_pos`를 안 쓰는 이유는 그러면 드래그가 안 먹기
+    // 때문이다.
+    if let Some(pos) = doc.filter_menu_anchor {
+        window = window.default_pos(pos);
+    }
+    window.show(ctx, |ui| {
+            // 검색창 하나로 두 역할을 겸한다(엑셀 자동필터와 같은 동작):
+            // 타이핑하는 즉시 아래 체크박스 목록이 실시간으로 좁혀지고(이건
+            // 화면 표시만 거르는 것이라 매 프레임 공짜), "Apply"를 누르면 이
+            // 텍스트가 그대로 "포함" 행 필터 조건이 된다. 값 목록이 너무 커서
+            // 잘린 컬럼(`truncated`)에서도, 체크박스에 없는 값까지 이 텍스트
+            // 하나로 걸러낼 수 있다.
+            ui.label(crate::theme::chrome_text("Search / contains:"));
+            ui.text_edit_singleline(&mut doc.filter_menu_search);
+
+            if let Some(job) = &doc.distinct_job {
+                let p = job.progress();
+                ui.add(
+                    egui::ProgressBar::new(p)
+                        .desired_width(220.0)
+                        .text(format!("{:.0}%", p * 100.0)),
+                );
+            } else if let Some(result) = &doc.distinct_values {
+                // 고유값 총 개수는 항상 보여준다 — 5,000개 이내면 스캔 중 값을
+                // 다 담아 뒀으니 정확한 수이고, 넘으면 HyperLogLog 근사치다
+                // (`DistinctCount` 주석 참조). 근사치는 "약"을 붙여 정확한 값과
+                // 헷갈리지 않게 한다.
+                let count_text = match result.count {
+                    crate::filter::DistinctCount::Exact(n) => format!("{n} distinct values"),
+                    crate::filter::DistinctCount::Approx(n) => format!("~{n} distinct values (estimated)"),
+                };
+                ui.label(crate::theme::chrome_text(count_text));
+                if result.truncated {
+                    ui.label(crate::theme::chrome_text(format!(
+                        "Too many distinct values — showing first {}. Use the text filter above to narrow down.",
+                        crate::filter::MAX_DISTINCT_VALUES
+                    )));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Select All").clicked() {
+                        doc.filter_menu_included = None;
+                    }
+                    if ui.button("Clear All").clicked() {
+                        doc.filter_menu_included = Some(std::collections::HashSet::new());
+                    }
+                });
+                let search_lower = doc.filter_menu_search.to_lowercase();
+                egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                    for (value, count) in &result.values {
+                        if !search_lower.is_empty() && !value.to_lowercase().contains(&search_lower) {
+                            continue;
+                        }
+                        let mut checked = match &doc.filter_menu_included {
+                            None => true,
+                            Some(set) => set.contains(value),
+                        };
+                        let label = if value.is_empty() {
+                            format!("(blank) ({count})")
+                        } else {
+                            format!("{value} ({count})")
+                        };
+                        if ui.checkbox(&mut checked, label).changed() {
+                            // "전체 선택"(None) 상태에서 하나만 끄려면 그 순간부터
+                            // 명시적 집합으로 전환해야 한다 — 안 그러면 끈 사실을
+                            // 저장할 곳이 없다. 지금까지 스캔된 값 전체를 채운 뒤
+                            // 이번에 끈 값만 뺀다(트렁케이션된 목록 밖의 값은 이
+                            // 조작 대상이 아니므로 영향받지 않는다).
+                            let mut set = doc.filter_menu_included.clone().unwrap_or_else(|| {
+                                result.values.iter().map(|(v, _)| v.clone()).collect()
+                            });
+                            if checked {
+                                set.insert(value.clone());
+                            } else {
+                                set.remove(value);
+                            }
+                            doc.filter_menu_included = Some(set);
+                        }
+                    }
+                });
+            } else {
+                ui.label(crate::theme::chrome_text("Scanning…"));
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Apply").clicked() {
+                    do_apply = true;
+                }
+                if ui.button("Clear Filter").clicked() {
+                    do_clear = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    doc.open_filter_menu = None;
+                }
+            });
+        });
+
+    if !open {
+        doc.open_filter_menu = None;
+    }
+
+    if do_clear {
+        doc.column_filters.remove(&col);
+        doc.open_filter_menu = None;
+        recompute_view_auto(doc, delim, data_start, ctx.clone());
+    } else if do_apply {
+        let f = crate::filter::ColumnFilter {
+            contains: doc.filter_menu_search.trim().to_string(),
+            included: doc.filter_menu_included.clone(),
+        };
+        if f.is_noop() {
+            doc.column_filters.remove(&col);
+        } else {
+            doc.column_filters.insert(col, f);
+        }
+        doc.open_filter_menu = None;
+        recompute_view_auto(doc, delim, data_start, ctx.clone());
+    }
+}
+
 /// 다중 컬럼 정렬 다이얼로그. 정렬 기준(컬럼·문자/숫자·오름/내림) 목록을
 /// 위(1차)→아래(N차) 순으로 편집하고, "정렬"로 백그라운드 다중 정렬을 시작한다.
 fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize, lang: crate::i18n::Lang) {
@@ -6246,22 +6767,10 @@ fn render_sort_dialog(ctx: &egui::Context, doc: &mut Document, col_base: usize, 
 
     if do_sort && !doc.sort_specs.is_empty() {
         doc.show_sort_dialog = false;
-        if doc.edit.is_some() {
-            // 편집 모드: 백그라운드 permutation 대신 lines를 물리적으로 재배치한다.
-            // 인메모리 정렬이라 동기 호출로 충분하다.
-            let specs = doc.sort_specs.clone();
-            apply_edit_sort(doc, &specs, delim, data_start);
-        } else {
-            doc.sort_job = Some(sort::spawn_multi_sort(
-                doc.source.clone(),
-                doc.index.clone(),
-                doc.enc,
-                delim,
-                doc.sort_specs.clone(),
-                data_start,
-                ctx.clone(),
-            ));
-        }
+        // `recompute_view_auto`로 보낸다 — 편집/뷰 모드, 필터 유무를 그
+        // 함수가 알아서 가른다(`recompute_view`/`recompute_edit_view` 주석).
+        doc.active_sort_specs = doc.sort_specs.clone();
+        recompute_view_auto(doc, delim, data_start, ctx.clone());
     }
 }
 
@@ -6321,6 +6830,10 @@ fn render_sort_controls(
                 spec_count,
             });
             doc.sort_job = None;
+            // 필터는 건드리지 않는다 — 이 완료 경로는 `recompute_view`가
+            // "필터 없음" 판단일 때만 `sort_job`을 띄우므로(`recompute_view`
+            // 주석 참조), 여기 도달했다는 것 자체가 `doc.filter`가 이미 없다는
+            // 뜻이다. 필터+정렬을 같이 쓰는 경우는 `filter_job` 쪽에서 처리된다.
         }
     }
 
@@ -6391,10 +6904,16 @@ fn render_sort_controls(
         }
     });
 
-    // 정렬 해제 버튼은 뷰 모드에서 permutation 정렬이 적용돼 있을 때만.
-    // (편집 모드 정렬은 lines에 이미 반영돼 되돌릴 permutation이 없다.)
+    // `doc.sort`가 Some인 경우: 뷰 모드에서 permutation 정렬이 적용돼 있을
+    // 때, 또는 편집 모드에서 필터+정렬을 함께 쓰는 중일 때(그때만 화살표
+    // 표시용으로 채워진다 — `recompute_edit_view` 주석)다. 편집 모드에서
+    // 필터 없이 건 정렬은 이미 lines에 물리적으로 반영돼 있어 `doc.sort`가
+    // 항상 None이므로 이 버튼 자체가 안 뜬다.
     if doc.sort.is_some() && ui.button(s.sort_clear).clicked() {
-        doc.sort = None;
+        doc.active_sort_specs.clear();
+        // 필터가 걸려 있으면 필터만 남기고 정렬은 뺀 결과로 다시 계산한다
+        // (정렬 해제가 필터까지 지우면 안 된다).
+        recompute_view_auto(doc, delim, data_start, ctx.clone());
     }
 
     if !complete && selected.is_some() {
@@ -6413,22 +6932,42 @@ fn render_sort_controls(
         if doc.parquet.is_some() {
             // Parquet은 mmap 바이트가 없어 `sort::spawn_sort`의 전제가 성립하지
             // 않는다. 정렬 키 컬럼만 읽는 별도 경로로 보낸다(메모리 확인 포함).
+            // Parquet 문서는 컬럼 필터를 지원하지 않으므로(같은 이유로 mmap
+            // 원본 바이트가 없다) 필터+정렬 조합을 고려할 필요가 없다.
             request_parquet_sort(doc, col, dir);
         } else if editing {
-            apply_edit_sort(doc, &[spec], delim, data_start);
+            // 편집 모드: `active_sort_specs`를 갱신하고 `recompute_edit_view`로
+            // 보낸다 — 필터가 없으면 기존 그대로 `apply_edit_sort`(물리적
+            // 재배열)를 타고, 필터가 있으면 그 안에서만 화면 표시 순서를
+            // 바꾼다(`recompute_edit_view` 주석).
+            doc.active_sort_specs = vec![spec];
+            recompute_edit_view(doc, delim, data_start);
         } else {
-            doc.sort_job = Some(sort::spawn_sort(
-                doc.source.clone(),
-                doc.index.clone(),
-                doc.enc,
-                delim,
-                col,
-                data_start,
-                kind,
-                dir,
-                ci,
-                ctx.clone(),
-            ));
+            doc.active_sort_specs = vec![spec];
+            if doc.column_filters.is_empty() {
+                // 필터가 없으면 기존 그대로 `spawn_sort`(단일 컬럼 전용 —
+                // `extract_and_multi_sort`보다 정밀한 tie-break)를 직접 쓴다.
+                // `recompute_view`를 거치면 다중 정렬 경로(`spawn_multi_sort`)로
+                // 통일되어 8바이트를 넘는 동률 문자열의 미세한 정렬 정밀도가
+                // 떨어진다 — 필터와 조합할 때만 감수할 만한 트레이드오프이지,
+                // 필터 없는 일반 정렬까지 덩달아 바꿀 이유는 없다.
+                doc.sort_job = Some(sort::spawn_sort(
+                    doc.source.clone(),
+                    doc.index.clone(),
+                    doc.enc,
+                    delim,
+                    col,
+                    data_start,
+                    kind,
+                    dir,
+                    ci,
+                    ctx.clone(),
+                ));
+            } else {
+                // 필터가 있으면 "필터링된 행 안에서만 정렬"해야 하므로
+                // `recompute_view`(→ 필터+정렬 결합 경로)로 보낸다.
+                recompute_view(doc, delim, data_start, ctx.clone());
+            }
         }
     }
 }
@@ -6602,6 +7141,34 @@ fn render_table(
     let scroll_to = doc.pending_scroll_row.take();
     let scroll_align = doc.pending_scroll_align;
 
+    // 진행 중인 배경 필터 적용 작업이 끝났는지 폴링해 결과를 반영한다.
+    // 정렬 폴링(`render_sort_controls`)과 같은 패턴이지만, 필터는 툴바에 전용
+    // 컨트롤이 없고 헤더 드롭다운에서만 시작되므로 매 프레임 도는 이 함수에서
+    // 함께 처리한다 — 그래야 드롭다운을 닫은 뒤에도(다이얼로그가 안 그려져도)
+    // 작업이 끝나는 즉시 표에 반영된다.
+    if let Some(job) = &mut doc.filter_job {
+        // specs를 결과 수거 전에 복사해 둔다 — `take_result()`가 `job`을
+        // 그대로 두긴 하지만(핸들 자체는 안 없어짐), 아래에서 `doc.filter_job
+        // = None`으로 이 job을 버리기 전에 화살표 표시용 정보를 뽑아야 한다.
+        let specs = job.specs.clone();
+        if let Some(matched) = job.take_result() {
+            doc.filter = Some(crate::filter::FilterState { matched });
+            doc.filter_job = None;
+            // 이 필터 작업이 정렬 기준과 함께 돌았다면(`recompute_view`가
+            // 필터+정렬 조합일 때 넘긴 것) 헤더 화살표 표시용으로 `doc.sort`도
+            // 채운다. permutation은 비워 둔다 — `render_table`의 permutation
+            // 선택은 필터를 우선하므로(`or_else`) 이 값은 화살표 표시 외에는
+            // 안 쓰인다, 굳이 같은 데이터를 두 번 들고 있을 이유가 없다.
+            doc.sort = specs.first().map(|first| SortState {
+                permutation: Vec::new(),
+                col: first.col,
+                kind: first.kind,
+                dir: first.dir,
+                spec_count: specs.len(),
+            });
+        }
+    }
+
     // 헤더 행 데이터(있으면 첫 줄)와 데이터 시작 행 결정.
     // `doc_line_count`를 쓴다 — Parquet은 `LineIndex`가 비어 있어
     // `index.line_count()`면 0이 되고 표가 통째로 비어 보인다.
@@ -6620,10 +7187,31 @@ fn render_table(
     // 정렬된 컬럼과 방향(헤더 화살표 표시용).
     let sorted_col_dir: Option<(usize, SortDir)> =
         doc.sort.as_ref().map(|s| (s.col, s.dir));
-    // permutation은 참조로만 사용(클론 방지). 정렬 시 행 순서 매핑에 씀.
-    let permutation: Option<&[u32]> = doc.sort.as_ref().map(|s| s.permutation.as_slice());
+    // permutation은 참조로만 사용(클론 방지). 정렬 또는 필터가 적용돼 있으면
+    // 행 순서/부분집합 매핑에 씀. 정렬·필터는 상호 배타적이므로(`render_sort_controls`
+    // 주석) 필터가 있으면 필터를, 없으면 정렬을 쓴다 — 동시에 Some인 경우는 없다.
+    let permutation: Option<&[u32]> = doc
+        .filter
+        .as_ref()
+        .map(|f| f.matched.as_slice())
+        .or_else(|| doc.sort.as_ref().map(|s| s.permutation.as_slice()));
+    // 화면에 실제로 그릴 행 수. 필터가 걸려 있으면 `data_rows`(필터 전 전체
+    // 데이터 행 수)보다 작을 수 있다 — `body.rows`의 가상 스크롤 행 수와
+    // 스크롤 클램프는 반드시 이 값을 써야 한다.
+    let view_row_count = permutation.map(|p| p.len()).unwrap_or(data_rows);
     // 헤더 클릭으로 새로 선택된 컬럼을 클로저 밖으로 전달하는 통로.
     let clicked_col: Cell<Option<usize>> = Cell::new(None);
+    // 필터 아이콘이 지금 조건을 가진 컬럼인지(아이콘 강조용) 스냅샷.
+    let filtered_cols: std::collections::HashSet<usize> =
+        doc.column_filters.keys().copied().collect();
+    // 필터 아이콘 클릭으로 열/닫을 컬럼을 클로저 밖으로 전달하는 통로
+    // (`clicked_col`과 같은 패턴 — 클로저는 doc을 불변으로만 빌린다).
+    let filter_icon_clicked: Cell<Option<usize>> = Cell::new(None);
+    // 그 컬럼 헤더 셀의 화면 좌표(왼쪽 아래 모서리) — 드롭다운을 그 자리
+    // 근처에 띄우기 위한 통로. `egui::Window` 기본값은 화면 좌상단이라, 이게
+    // 없으면 필터를 어느 컬럼에서 열든 매번 좌상단에 떴다(실제로 그렇게
+    // 보고됨).
+    let filter_icon_pos: Cell<Option<egui::Pos2>> = Cell::new(None);
 
     // ---- 편집 모드 상태 스냅샷 + 클로저 → 바깥 인텐트 통로 ----
     // 테이블 클로저는 doc을 불변으로만 빌린다. 셀 상호작용 결과는 여기 모아
@@ -6732,6 +7320,21 @@ fn render_table(
     // (`scroll_offset_for_row` 주석) — 여기서 한 번 읽어 그대로 넘긴다.
     let spacing_y = ui.spacing().item_spacing.y;
 
+    // 필터 적용이 배경에서 도는 동안은 진행률만 보여준다(표는 이전 결과를
+    // 그대로 보여주다가 끝나면 다음 프레임에 갱신된다 — 정렬 진행 중
+    // `render_sort_controls`가 하는 것과 같은 사용자 경험).
+    if let Some(job) = &doc.filter_job {
+        let p = job.progress();
+        ui.horizontal(|ui| {
+            ui.label(crate::theme::chrome_text("필터 적용 중…"));
+            ui.add(
+                egui::ProgressBar::new(p)
+                    .desired_width(160.0)
+                    .text(format!("{:.0}%", p * 100.0)),
+            );
+        });
+    }
+
     // 컬럼은 auto()(전 행 measure로 대용량에서 느림) 대신 고정 초기폭 +
     // 드래그 조절(resizable)로 둔다. 긴 값은 셀에서 truncate 되고 폭을
     // 넓히면 전체가 보인다.
@@ -6762,7 +7365,7 @@ fn render_table(
     if let Some(row) = scroll_to {
         // 요청된 행은 실제 존재하는 마지막 데이터 행으로 클램프한다
         // (`scroll_to_row`가 내부적으로 하던 일 — offset 경로에는 없으므로 여기서).
-        let row = row.min(data_rows.saturating_sub(1));
+        let row = row.min(view_row_count.saturating_sub(1));
         table = table.vertical_scroll_offset(scroll_offset_for_row(
             row,
             scroll_align,
@@ -6786,12 +7389,23 @@ fn render_table(
             for c in 0..col_count {
                 header.col(|ui| {
                     let selected = selected_col == Some(c);
-                    // 셀 전체 영역을 클릭 대상으로 만든다(글자뿐 아니라 헤더 칸
-                    // 어디를 눌러도 선택되도록). 먼저 셀의 남은 사각형 전체에
-                    // 클릭 sense 응답을 만든다.
                     let cell_rect = ui.max_rect();
+                    // 오른쪽에 필터 아이콘(▾)을 위한 작은 사각형을 떼어낸다. 나머지
+                    // (라벨) 영역만 "헤더 클릭 = 컬럼 선택"의 클릭 대상으로 삼아야
+                    // 아이콘을 눌렀을 때 선택도 같이 토글되는 이중 반응을 막을 수
+                    // 있다(두 `interact` 사각형이 겹치면 한 클릭이 둘 다에 잡힌다).
+                    let icon_size = 14.0;
+                    let icon_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            cell_rect.right() - icon_size - 3.0,
+                            cell_rect.center().y - icon_size / 2.0,
+                        ),
+                        egui::vec2(icon_size, icon_size),
+                    );
+                    let label_rect =
+                        egui::Rect::from_min_max(cell_rect.min, egui::pos2(icon_rect.left(), cell_rect.max.y));
                     let resp = ui.interact(
-                        cell_rect,
+                        label_rect,
                         ui.id().with(("hdr", c)),
                         egui::Sense::click(),
                     );
@@ -6815,7 +7429,83 @@ fn render_table(
                         _ => "",
                     };
                     let rich = egui::RichText::new(format!("{base}{arrow}")).strong();
-                    ui.add(egui::Label::new(rich).truncate());
+                    ui.allocate_ui_at_rect(label_rect, |ui| {
+                        ui.add(egui::Label::new(rich).truncate());
+                    });
+                    // 필터 아이콘. 평소엔 흰색으로 채워 옅게 보이다가, 이 컬럼에
+                    // 조건이 걸리면 검정으로 채워 "지금 필터링 중"임을 알린다
+                    // (엑셀의 빈 깔때기 ↔ 채워진 깔때기와 같은 신호). 테두리
+                    // 선(stroke)은 쓰지 않는다 — 사다리꼴과 기둥, 두 도형을
+                    // 각각 테두리까지 그리면 맞닿는 경계에 이중선이 생겨 이음매가
+                    // 두드러진다(실제로 그렇게 보였다). 채우기만 쓰면 그 이음매가
+                    // 사라진다.
+                    let icon_resp = ui.interact(
+                        icon_rect,
+                        ui.id().with(("hdrfilter", c)),
+                        egui::Sense::click(),
+                    );
+                    let icon_active = filtered_cols.contains(&c);
+                    let hovered = icon_resp.hovered();
+                    let icon_fill = if icon_active {
+                        egui::Color32::BLACK
+                    } else if hovered {
+                        // 클릭 가능함을 알리는 호버 피드백 — 평소보다 눈에 띄게 진하다.
+                        egui::Color32::from_gray(140)
+                    } else {
+                        // 헤더 셀 배경(`header_bg()` = gray(236))보다 한 톤
+                        // 진한 회색 — 흰색은 헤더 배경과 거의 안 갈라져 있는지
+                        // 없는지 안 보였다.
+                        egui::Color32::from_gray(210)
+                    };
+                    let icon_stroke = egui::Stroke::NONE;
+                    // 글자가 아니라 **직접 그린 다각형**이다. 텍스트 글리프(예:
+                    // "▾")는 이 앱이 로드하는 폰트 어디에도 없으면 두부(□)로
+                    // 보인다(`install_fonts` 주석 — 검증된 기호는 `↑ ↓ ✖ ●`뿐).
+                    // 정렬 화살표(↑↓)를 재사용하면 폰트 문제는 피해도 "정렬"이라는
+                    // 기존 의미와 겹쳐 혼동을 준다. 콤보박스의 드롭다운 화살표도
+                    // 글꼴이 아니라 벡터 도형인 것과 같은 이유로, 여기서도 실제
+                    // 깔때기 모양을 폴리곤으로 그려 폰트 지원 여부와 무관하게 항상
+                    // 같은 모습이 나오게 한다.
+                    //
+                    // 사다리꼴(입구) + 기둥(손잡이) 두 도형으로 나눠 그린다.
+                    // `Shape::convex_polygon`은 볼록 다각형만 올바르게 삼각분할한다
+                    // — 위가 넓다가 목에서 좁아졌다가 다시 곧게 내려가는 모래시계
+                    // 윤곽을 점 6개짜리 한 다각형으로 그리면 목 부분이 오목(reflex
+                    // 각)이라 삼각분할이 엉뚱하게 갈라져 좌우 비대칭으로 찌그러진다
+                    // (실제로 그렇게 나왔다). 사다리꼴과 기둥은 각각 볼록하므로
+                    // 따로 그리면 대칭이 보장된다.
+                    let r = icon_rect.shrink(1.0);
+                    let cx = r.center().x;
+                    let top_half = r.width() * 0.5;
+                    let neck_half = r.width() * 0.16;
+                    let neck_y = r.top() + r.height() * 0.55;
+                    let trapezoid = vec![
+                        egui::pos2(cx - top_half, r.top()),
+                        egui::pos2(cx + top_half, r.top()),
+                        egui::pos2(cx + neck_half, neck_y),
+                        egui::pos2(cx - neck_half, neck_y),
+                    ];
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        trapezoid,
+                        icon_fill,
+                        icon_stroke,
+                    ));
+                    let stem_half = neck_half * 0.55;
+                    let stem = vec![
+                        egui::pos2(cx - stem_half, neck_y),
+                        egui::pos2(cx + stem_half, neck_y),
+                        egui::pos2(cx + stem_half, r.bottom()),
+                        egui::pos2(cx - stem_half, r.bottom()),
+                    ];
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        stem,
+                        icon_fill,
+                        icon_stroke,
+                    ));
+                    if icon_resp.clicked() {
+                        filter_icon_clicked.set(Some(c));
+                        filter_icon_pos.set(Some(cell_rect.left_bottom()));
+                    }
                     if resp.clicked() {
                         clicked_col.set(Some(c));
                     }
@@ -6823,7 +7513,7 @@ fn render_table(
             }
         })
         .body(|body| {
-            body.rows(row_h, data_rows, |mut row| {
+            body.rows(row_h, view_row_count, |mut row| {
                 let view_row = row.index();
                 min_drawn_row.set(Some(
                     min_drawn_row.get().map_or(view_row, |m: usize| m.min(view_row)),
@@ -7059,6 +7749,45 @@ fn render_table(
         };
         doc.cell_sel = None;
         doc.cell_drag_active = false;
+    }
+
+    // 필터 아이콘 클릭 → 드롭다운 토글. 같은 컬럼을 다시 누르면 닫고, 다른
+    // 컬럼이면 그 컬럼의 기존 조건으로 편집 상태를 초기화한 뒤 연다. 고유값
+    // 목록은 컬럼이 바뀔 때만 새로 스캔한다(`distinct_values_col`로 판단) —
+    // 열 때마다 다시 돌리면 같은 컬럼을 여러 번 여닫을 때 매번 스캔이 걸린다.
+    if let Some(c) = filter_icon_clicked.get() {
+        if doc.open_filter_menu == Some(c) {
+            doc.open_filter_menu = None;
+        } else {
+            doc.open_filter_menu = Some(c);
+            doc.filter_menu_anchor = filter_icon_pos.get();
+            let existing = doc.column_filters.get(&c).cloned().unwrap_or_default();
+            // 검색창 = 이전에 적용된 "포함" 조건으로 되돌린다(이 컬럼을 다시
+            // 열었을 때 지난번 조건이 그대로 보이도록).
+            doc.filter_menu_search = existing.contains;
+            doc.filter_menu_included = existing.included;
+            if doc.distinct_values_col != Some(c) {
+                doc.distinct_values_col = Some(c);
+                if let Some(e) = &doc.edit {
+                    // 편집 모드: 이미 메모리에 다 올라와 있으므로(`enter_edit_mode`
+                    // 주석) 배경 작업 없이 그 자리에서 바로 계산한다.
+                    doc.distinct_job = None;
+                    doc.distinct_values =
+                        Some(crate::filter::extract_distinct_lines(&e.lines, delim, c, data_start));
+                } else {
+                    doc.distinct_values = None;
+                    doc.distinct_job = Some(crate::filter::spawn_distinct_values(
+                        doc.source.clone(),
+                        doc.index.clone(),
+                        doc.enc,
+                        delim,
+                        c,
+                        data_start,
+                        ui.ctx().clone(),
+                    ));
+                }
+            }
+        }
     }
 
     // ---- 여기서부터 편집 인텐트 적용(테이블 클로저 종료 → doc 가변 대여 가능) ----
@@ -9923,6 +10652,49 @@ mod tests {
         assert!(doc.indexer.is_none(), "헥스 문서는 줄 인덱서를 돌리지 않는다");
         assert!(matches!(doc.sep, SeparatorMode::None));
         assert_eq!(doc.source.len(), 6);
+        std::fs::remove_file(&p).ok();
+    }
+
+    // ---- Zip 배선 ----
+
+    #[test]
+    fn zip_with_a_single_csv_opens_as_a_text_document() {
+        let p = crate::archive::testutil::temp_path("openpath");
+        crate::archive::testutil::write_zip(&p, &[("data.csv", b"a,b\n1,2\n3,4\n")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc().expect("탭이 열려야 한다");
+        assert!(app.error.is_none(), "에러 없이 열려야 한다: {:?}", app.error);
+        assert_eq!(doc.sep, SeparatorMode::Char(b','), "zip 안 항목의 확장자로 구분자를 감지");
+        assert!(doc.has_header, "첫 논리 행이 컬럼 이름이다");
+        assert!(doc.path.as_os_str().is_empty(), "디스크에 대응하는 실제 파일이 없다");
+        assert!(doc.path_label.contains("data.csv"), "탭 라벨에 zip 안 파일 이름이 보여야 한다");
+        assert!(doc.is_extracted, "zip에서 꺼낸 문서는 추출본으로 표시한다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn zip_with_no_csv_reports_an_error_without_opening_a_tab() {
+        let p = crate::archive::testutil::temp_path("noent");
+        crate::archive::testutil::write_zip(&p, &[("readme.md", b"hello")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert!(app.error.is_some(), "표 형식 파일이 없으면 에러");
+        assert!(app.doc().is_none(), "탭이 열리면 안 된다");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn zip_with_multiple_csvs_reports_an_error_without_opening_a_tab() {
+        let p = crate::archive::testutil::temp_path("multi");
+        crate::archive::testutil::write_zip(&p, &[("a.csv", b"1"), ("b.csv", b"2")]);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        assert!(app.error.is_some(), "여러 후보면 에러");
+        assert!(app.doc().is_none(), "탭이 열리면 안 된다");
         std::fs::remove_file(&p).ok();
     }
 
@@ -19332,6 +20104,271 @@ mod tests {
             ctx.memory(|m| m.focused()),
             None,
             "포커스가 File 메뉴로 가면 안 된다"
+        );
+    }
+
+    // ---- 필터+정렬 조합(`recompute_view`) ----
+
+    /// 백그라운드 job이 끝날 때까지 스핀 대기한다. 테스트 데이터가 작아 보통
+    /// 밀리초 단위로 끝난다.
+    fn wait_filter_job(doc: &mut Document) -> Vec<u32> {
+        loop {
+            if let Some(job) = &mut doc.filter_job {
+                if job.is_finished() {
+                    return job.take_result().expect("끝났으면 결과가 있어야 한다");
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn wait_sort_job(doc: &mut Document) -> Vec<u32> {
+        loop {
+            if let Some(job) = &mut doc.sort_job {
+                if job.is_finished() {
+                    return job.take_result().expect("끝났으면 결과가 있어야 한다");
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// 필터를 먼저 건 뒤 정렬하면, 필터링된 행 수 그대로 그 안에서만
+    /// 정렬돼야 한다(엑셀과 같은 동작) — 사용자가 실사용 중 "정렬하니 필터가
+    /// 풀린 것처럼 보인다"고 보고한 시나리오를 그대로 재현한다.
+    #[test]
+    fn recompute_view_sorts_within_filtered_subset() {
+        // city: Seoul(0,2,4), Busan(1,3). age: 30,25,40,22,35.
+        let content = b"name,city,age\nAlice,Seoul,30\nBob,Busan,25\nCarol,Seoul,40\nDave,Busan,22\nEve,Seoul,35\n";
+        let p = temp(content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        assert!(doc.has_header);
+        let delim = b',';
+        let data_start = 1;
+
+        // 1) city(컬럼 1) 필터: Seoul만.
+        let mut included = std::collections::HashSet::new();
+        included.insert("Seoul".to_string());
+        doc.column_filters.insert(
+            1,
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+        );
+        recompute_view(doc, delim, data_start, ctx.clone());
+        let matched = wait_filter_job(doc);
+        doc.filter = Some(crate::filter::FilterState { matched });
+        assert_eq!(
+            doc.filter.as_ref().unwrap().matched,
+            vec![1, 3, 5],
+            "Seoul 행(논리행 1,3,5 — 헤더가 0행)만 남아야 한다"
+        );
+
+        // 2) age(컬럼 2) 오름차순 정렬 — 필터링된 3행 안에서만.
+        let spec = SortSpec { col: 2, kind: SortKind::Number, dir: SortDir::Asc, ci: false };
+        doc.active_sort_specs = vec![spec];
+        recompute_view(doc, delim, data_start, ctx.clone());
+        // 필터가 걸려 있으므로 filter_job(정렬 포함) 경로로 가야 하고,
+        // sort_job은 쓰이지 않아야 한다.
+        assert!(doc.sort_job.is_none(), "필터가 있으면 순수 sort_job이 아니라 filter_job으로 가야 한다");
+        let matched = wait_filter_job(doc);
+        doc.filter = Some(crate::filter::FilterState { matched: matched.clone() });
+
+        // 행 수는 여전히 3(필터가 풀리면 안 된다) — Seoul 행만: Alice(1,30),
+        // Carol(2,40)→논리행5, Eve(2,35)→논리행5... 실제 논리행 매핑:
+        // 0=header,1=Alice/Seoul/30,2=Bob/Busan/25,3=Carol/Seoul/40,
+        // 4=Dave/Busan/22,5=Eve/Seoul/35. age 오름: Alice(30,행1) <
+        // Eve(35,행5) < Carol(40,행3) → [1,5,3].
+        assert_eq!(
+            matched.len(),
+            3,
+            "정렬 후에도 필터링된 행 수(3개)가 유지돼야 한다 — 풀리면 안 된다"
+        );
+        assert_eq!(matched, vec![1, 5, 3], "필터링된 행 안에서 age 오름차순으로 정렬돼야 한다");
+    }
+
+    /// 정렬을 먼저 건 뒤 필터를 걸어도(반대 순서) 똑같이 결합돼야 한다.
+    #[test]
+    fn recompute_view_combines_when_sort_applied_before_filter() {
+        let content = b"name,city,age\nAlice,Seoul,30\nBob,Busan,25\nCarol,Seoul,40\nDave,Busan,22\nEve,Seoul,35\n";
+        let p = temp(content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        let delim = b',';
+        let data_start = 1;
+
+        // 1) 정렬 먼저: age 오름.
+        doc.active_sort_specs = vec![SortSpec { col: 2, kind: SortKind::Number, dir: SortDir::Asc, ci: false }];
+        recompute_view(doc, delim, data_start, ctx.clone());
+        assert!(doc.filter_job.is_none(), "필터가 없으면 sort_job 경로여야 한다");
+        let perm = wait_sort_job(doc);
+        assert_eq!(perm.len(), 5, "필터가 없으니 전체 5행이어야 한다");
+
+        // 2) 그 다음 city 필터: Seoul만.
+        let mut included = std::collections::HashSet::new();
+        included.insert("Seoul".to_string());
+        doc.column_filters.insert(
+            1,
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+        );
+        recompute_view(doc, delim, data_start, ctx.clone());
+        let matched = wait_filter_job(doc);
+        assert_eq!(
+            matched, vec![1, 5, 3],
+            "정렬을 먼저 걸어도 이후 필터가 그 정렬 기준을 이어받아 결합돼야 한다"
+        );
+    }
+
+    /// 필터를 지우면(정렬은 남아 있음) 파일 전체를 그 정렬 기준으로 다시
+    /// 정렬해야 한다 — 부분집합 permutation이 남아 전체 파일 중 필터링됐던
+    /// 3행만 보이는 채로 굳어지면 안 된다.
+    #[test]
+    fn recompute_view_resorts_whole_file_after_filter_cleared() {
+        let content = b"name,city,age\nAlice,Seoul,30\nBob,Busan,25\nCarol,Seoul,40\nDave,Busan,22\nEve,Seoul,35\n";
+        let p = temp(content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        let delim = b',';
+        let data_start = 1;
+
+        let mut included = std::collections::HashSet::new();
+        included.insert("Seoul".to_string());
+        doc.column_filters.insert(
+            1,
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+        );
+        doc.active_sort_specs = vec![SortSpec { col: 2, kind: SortKind::Number, dir: SortDir::Asc, ci: false }];
+        recompute_view(doc, delim, data_start, ctx.clone());
+        let matched = wait_filter_job(doc);
+        assert_eq!(matched.len(), 3);
+
+        // 필터 해제.
+        doc.column_filters.clear();
+        recompute_view(doc, delim, data_start, ctx.clone());
+        assert!(doc.filter_job.is_none(), "필터가 없으니 sort_job 경로여야 한다");
+        let perm = wait_sort_job(doc);
+        assert_eq!(perm.len(), 5, "필터 해제 후에는 전체 5행이 다시 보여야 한다");
+    }
+
+    // ---- 편집 모드에서의 필터+정렬 조합 ----
+    //
+    // 실사용 버그 재현: 작은 파일은 자동으로 편집 모드로 열리는데
+    // (`auto_edit_on_open`), 편집 모드 정렬(`apply_edit_sort`)이 필터 상태를
+    // 몰라서 "정렬하면 필터가 풀린 것처럼 보인다"는 형태로 보고됐다. 아래
+    // 테스트들은 `enter_edit_mode` 경유 여부와 무관하게 `recompute_edit_view`
+    // 자체가 그 조합을 정확히 처리하는지 직접 확인한다.
+
+    fn edit_mode_test_doc() -> App {
+        let content = b"name,city,age\nAlice,Seoul,30\nBob,Busan,25\nCarol,Seoul,40\nDave,Busan,22\nEve,Seoul,35\n";
+        let p = temp(content);
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.open_path(&p, &ctx);
+        let doc = app.doc_mut().unwrap();
+        doc.indexer.take().unwrap().join().unwrap();
+        enter_edit_mode(doc);
+        assert!(doc.edit.is_some(), "사전 조건: 편집 모드");
+        app
+    }
+
+    #[test]
+    fn recompute_edit_view_sorts_within_filtered_subset() {
+        let mut app = edit_mode_test_doc();
+        let doc = app.doc_mut().unwrap();
+        let delim = b',';
+        let data_start = 1;
+
+        let mut included = std::collections::HashSet::new();
+        included.insert("Seoul".to_string());
+        doc.column_filters.insert(
+            1,
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+        );
+        recompute_edit_view(doc, delim, data_start);
+        assert_eq!(
+            doc.filter.as_ref().unwrap().matched,
+            vec![1, 3, 5],
+            "Seoul 행만 남아야 한다"
+        );
+
+        doc.active_sort_specs = vec![SortSpec { col: 2, kind: SortKind::Number, dir: SortDir::Asc, ci: false }];
+        recompute_edit_view(doc, delim, data_start);
+        let matched = &doc.filter.as_ref().unwrap().matched;
+        assert_eq!(
+            matched.len(),
+            3,
+            "편집 모드에서 정렬해도 필터링된 행 수(3개)가 유지돼야 한다 — \
+             풀리면 안 된다(실사용 버그 재현)"
+        );
+        assert_eq!(*matched, vec![1, 5, 3], "필터링된 행 안에서 age 오름차순으로 정렬돼야 한다");
+        // 필터+정렬 조합일 때는 화면 표시용으로만 순서를 바꾸고, 실제
+        // 버퍼(e.lines)는 물리적으로 재배열하지 않는다(`recompute_edit_view` 주석).
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines[1],
+            "Alice,Seoul,30",
+            "필터+정렬 조합 중에는 e.lines 자체가 재배열되면 안 된다"
+        );
+    }
+
+    #[test]
+    fn recompute_edit_view_falls_back_to_physical_reorder_without_filter() {
+        // 필터 없이 정렬만 하면 기존 그대로 물리적 재배열(undo 가능)이어야
+        // 한다 — 필터+정렬 조합 지원을 넣으면서 이 기존 동작을 깨면 안 된다.
+        let mut app = edit_mode_test_doc();
+        let doc = app.doc_mut().unwrap();
+        let delim = b',';
+        let data_start = 1;
+
+        doc.active_sort_specs = vec![SortSpec { col: 2, kind: SortKind::Number, dir: SortDir::Asc, ci: false }];
+        recompute_edit_view(doc, delim, data_start);
+        assert!(doc.filter.is_none(), "필터가 없으니 doc.filter는 비어 있어야 한다");
+        // age 오름: Dave(22), Bob(25), Alice(30), Eve(35), Carol(40).
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines[1],
+            "Dave,Busan,22",
+            "필터가 없으면 e.lines가 물리적으로 재배열돼야 한다(기존 동작)"
+        );
+    }
+
+    #[test]
+    fn recompute_edit_view_resorts_physically_after_filter_cleared() {
+        let mut app = edit_mode_test_doc();
+        let doc = app.doc_mut().unwrap();
+        let delim = b',';
+        let data_start = 1;
+
+        let mut included = std::collections::HashSet::new();
+        included.insert("Seoul".to_string());
+        doc.column_filters.insert(
+            1,
+            crate::filter::ColumnFilter { contains: String::new(), included: Some(included) },
+        );
+        doc.active_sort_specs = vec![SortSpec { col: 2, kind: SortKind::Number, dir: SortDir::Asc, ci: false }];
+        recompute_edit_view(doc, delim, data_start);
+        assert_eq!(doc.filter.as_ref().unwrap().matched.len(), 3);
+
+        // 필터 해제 — 정렬 기준은 남아 있으므로 이제 전체를 물리적으로
+        // 재배열해야 한다.
+        doc.column_filters.clear();
+        recompute_edit_view(doc, delim, data_start);
+        assert!(doc.filter.is_none(), "필터 해제 후에는 doc.filter가 비어 있어야 한다");
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines.len() - data_start,
+            5,
+            "전체 5행이 다시 보여야 한다"
+        );
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines[1],
+            "Dave,Busan,22",
+            "필터 해제 후 남아 있던 정렬 기준으로 전체가 물리적으로 재배열돼야 한다"
         );
     }
 }

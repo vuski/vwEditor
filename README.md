@@ -2,6 +2,10 @@
 
 **한국어** | [English](#vweditor-english)
 
+> 이 저장소는 [vuski/vwEditor](https://github.com/vuski/vwEditor)의 포크입니다.
+> 원본 대비 **가로 스크롤**, **컬럼별 필터링**, **zip 안 CSV/TSV 열기(단일 파일)**를
+> 추가했습니다. 아래 설명은 원본 README를 그대로 두고 있습니다.
+
 대용량 CSV/TSV/텍스트 파일을 즉시 여는 뷰어 겸 에디터입니다. Rust + egui.
 parquet 조회도 가능합니다.
 
@@ -43,6 +47,8 @@ parquet 조회도 가능합니다.
 - **Hex 모드** — 바이너리 파일을 16진수로 봅니다(읽기 전용).
 - **Parquet / GeoParquet** — 읽기 전용. geometry 컬럼은 `POINT(127.02 37.51)`,
   `POLYGON(1,204 pts)` 형태로 요약해 보여줍니다. CSV/TSV로 내보내기 가능합니다.
+- **zip 안 CSV/TSV 열기** — csv/tsv/psv/txt 파일 하나짜리 zip을 그대로 열 수 있습니다
+  (읽기 전용, 저장은 다른 이름으로).
 - **파싱 오류 행 검출** — 따옴표가 안 닫힌 행 등을 찾아 줍니다.
 - **한국어·영어 UI** — 시작할 때 OS 로케일을 따르고, 메뉴 > 언어에서 바꿀 수 있습니다.
 - **멀티탭**, **드래그앤드롭**, **Ctrl+휠 확대**(0.5~4.0배).
@@ -145,6 +151,11 @@ cargo build --release
 
 [한국어](#vweditor) | **English**
 
+> This repository is a fork of [vuski/vwEditor](https://github.com/vuski/vwEditor).
+> It adds **horizontal scrolling**, **per-column filtering**, and **opening a
+> single CSV/TSV file inside a zip** on top of the original. The description
+> below is kept as-is from the original README.
+
 A viewer and editor that opens large CSV/TSV/text files instantly. Rust + egui.
 It reads parquet files too.
 
@@ -188,6 +199,8 @@ line positions in the background. The scrollbar grows as indexing progresses.
 - **Hex mode** — view binary files as hexadecimal (read-only).
 - **Parquet / GeoParquet** — read-only. Geometry columns are summarized as
   `POINT(127.02 37.51)` or `POLYGON(1,204 pts)`. Exportable to CSV/TSV.
+- **Open CSV/TSV inside a zip** — opens a zip containing a single csv/tsv/psv/txt file
+  directly (read-only; save goes to a new path).
 - **Malformed row detection** — finds rows with unclosed quotes and similar problems.
 - **English and Korean UI** — follows your OS locale at startup; switchable under **Language** in the menu bar.
 - **Multiple tabs**, **drag and drop**, **Ctrl+wheel zoom** (0.5×–4.0×).

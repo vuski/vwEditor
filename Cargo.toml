@@ -36,6 +36,11 @@ arrow-schema = "59"
 # 이스케이프된 따옴표 하나에 멀쩡한 컬럼을 geometry로 오인한다.
 serde_json = "1"
 
+# zip 압축 CSV/TSV를 열 때만 쓴다(src/archive.rs). deflate만 있으면 되므로
+# default-features를 끄고 그 codec만 켠다 — bzip2/zstd/lzma는 실무 zip에서
+# 거의 안 쓰이고 빌드 시간·바이너리만 늘린다.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 # exe에 아이콘을 심는 데만 쓴다(build.rs 참조). Windows 외에서는 no-op.
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
