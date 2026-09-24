@@ -6735,6 +6735,23 @@ fn render_table(
     // 컬럼은 auto()(전 행 measure로 대용량에서 느림) 대신 고정 초기폭 +
     // 드래그 조절(resizable)로 둔다. 긴 값은 셀에서 truncate 되고 폭을
     // 넓히면 전체가 보인다.
+    // 이번 프레임에 그려진 행 중 가장 작은 화면 행. Page Up/Down이 "지금
+    // 어디를 보고 있나"를 알 유일한 방법이다(`Document::first_visible_row`
+    // 주석 참조). 클로저는 doc을 불변으로만 빌리므로 `Cell`에 모았다가
+    // 클로저 종료 뒤 doc에 쓴다(`clicked_col`과 같은 통로). 아래 가로 스크롤
+    // 클로저 밖에서도 읽어야 하므로 그 클로저보다 먼저 선언해 캡처시킨다.
+    let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
+
+    // `TableBuilder`(egui_extras 0.28)는 안쪽에서 세로만 스크롤 영역으로
+    // 감싼다(가로는 하드코딩으로 꺼져 있음) — 컬럼이 많아 전체 폭이 창을
+    // 넘으면 뒤쪽 컬럼이 스크롤 없이 그냥 잘렸다. 바깥에 가로 전용
+    // `ScrollArea`를 한 겹 더 씌운다. 컬럼이 `Column::initial`(고정폭)이라
+    // 표의 실제 폭이 뷰포트 폭에 매이지 않으므로, 세로는 안쪽 TableBuilder가
+    // 그대로 담당하고 가로만 바깥 ScrollArea가 담당해도 서로 간섭하지 않는다.
+    egui::ScrollArea::horizontal()
+        .id_source("render_table_hscroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
     let mut table = TableBuilder::new(ui)
         .striped(true)
         .auto_shrink([false, false])
@@ -6755,12 +6772,6 @@ fn render_table(
             (avail_height - row_h).max(0.0),
         ));
     }
-
-    // 이번 프레임에 그려진 행 중 가장 작은 화면 행. Page Up/Down이 "지금
-    // 어디를 보고 있나"를 알 유일한 방법이다(`Document::first_visible_row`
-    // 주석 참조). 클로저는 doc을 불변으로만 빌리므로 `Cell`에 모았다가
-    // 클로저 종료 뒤 doc에 쓴다(`clicked_col`과 같은 통로).
-    let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
 
     table
         .header(row_h, |mut header| {
@@ -7023,6 +7034,7 @@ fn render_table(
                     });
                 }
             });
+        });
         });
 
     // Page Up/Down이 읽을 "지금 보고 있는 자리". **아래의 `if !editing { return }`
@@ -8494,6 +8506,13 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
         Vec::new()
     };
 
+    // 표 렌더와 같은 이유(`render_table`의 `ScrollArea::horizontal` 주석) —
+    // `TableBuilder`가 가로 스크롤을 지원하지 않으므로 바깥에 한 겹 씌운다.
+    // 확대 배율이 커지면 offset/hex/ascii 세 컬럼 합이 창 폭을 넘을 수 있다.
+    egui::ScrollArea::horizontal()
+        .id_source("render_hex_hscroll")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
     let mut table = TableBuilder::new(ui)
         .striped(false)
         .auto_shrink([false, false])
@@ -8650,6 +8669,7 @@ fn render_hex(ui: &mut egui::Ui, doc: &mut Document, clipboard: &mut String) {
             });
         });
     });
+        });
 
     // ---- 클로저 종료 → doc 가변 대여 가능 ----
 
