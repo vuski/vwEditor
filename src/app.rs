@@ -94,6 +94,8 @@ pub struct Document {
     pub text_sel: Option<(crate::edit::TextPos, crate::edit::TextPos)>,
     /// 텍스트 커서(텍스트 모드).
     pub text_caret: crate::edit::TextPos,
+    /// 텍스트 모드 가로 스크롤 상태(`TextHScroll` 주석).
+    pub text_hscroll: TextHScroll,
     /// 드래그 선택이 텍스트 줄에서 시작됐는지. `cell_drag_active`와 같은 이유로
     /// 필요하다 — egui의 primary_down은 전역 상태라 누름이 어디서 시작됐는지
     /// 알 수 없고, is_pointer_button_down_on()은 우클릭에도 참이다.
@@ -746,6 +748,7 @@ impl App {
             cell_drag_active: false,
             text_sel: None,
             text_caret: crate::edit::TextPos { line: 0, col: 0 },
+            text_hscroll: TextHScroll::default(),
             text_drag_active: false,
             ime_preview: String::new(),
             pending_column_op: None,
@@ -2822,6 +2825,49 @@ fn apply_page_scroll(doc: &mut Document, dir: PageDir) {
 /// `style.scroll_animation`/`ScrollAnimation`도 **없다**(레지스트리 소스 확인).
 /// 그래서 이 버전에서 즉시 점프를 얻는 길은 offset 직접 지정뿐이다.
 ///
+/// 텍스트 모드 가로 스크롤 상태. 한 프레임의 관측값을 다음 프레임이 읽는다
+/// (egui 즉시 모드라 "지금 화면이 어디인가"는 그려 본 뒤에야 안다).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextHScroll {
+    /// 지금까지 화면에 그려진 줄 중 가장 넓은 폭(px, 여유 포함). 텍스트 열
+    /// 폭 = 가로 스크롤 범위가 이 값이다. **보인 줄만** 잰다 — 파일 전체의
+    /// 최장 줄을 찾으려면 전체 스캔이 필요한데, 그 대신 이미 줄마다 만드는
+    /// galley의 폭을 읽기만 한다(추가 비용 0). 줄어들지 않는다: 스크롤하다
+    /// 짧은 구간에 오면 범위가 줄어 화면이 튀는 것을 막는다.
+    pub measured_w: f32,
+    /// `measured_w`를 잰 글꼴 크기. 확대/축소로 바뀌면 다시 잰다.
+    pub font_size: f32,
+    /// 가로 offset(px). 텍스트 열 안에서 글자를 이만큼 왼쪽으로 옮겨 그린다.
+    /// 이 값의 주인은 우리다(egui `ScrollArea`가 아니다) — 라인번호 열을
+    /// 고정하려면 표 전체가 아니라 텍스트 열 안쪽만 밀어야 하기 때문이다.
+    pub offset: f32,
+    /// 지난 프레임에 텍스트 열이 보여 준 폭(px).
+    pub view_w: f32,
+    /// 키 입력으로 캐럿이 움직였다 — 다음 프레임에 캐럿이 보이도록 가로
+    /// offset을 옮긴다. 마우스로 옮긴 캐럿은 이미 보이는 자리이므로 세우지 않는다.
+    pub follow_caret: bool,
+}
+
+/// 캐럿 x(스크롤 내용 좌표)가 보이도록 할 새 가로 offset. 이미 보이면 `None`.
+///
+/// 캐럿이 가장자리에 닿을 때마다 한 글자씩 밀면 타이핑 중 화면이 계속 떨린다.
+/// 그래서 넘어가면 `chunk`만큼 여유를 두고 한 번에 옮긴다(메모장과 같은 방식).
+/// 왼쪽으로 넘어갔는데 캐럿이 첫 화면 안에 들어가면 0으로 돌아간다 — Home이
+/// 줄 맨 앞과 라인번호를 함께 보여 주도록.
+fn hscroll_to_show(x: f32, off: f32, view_w: f32, chunk: f32) -> Option<f32> {
+    if view_w <= 0.0 {
+        return None;
+    }
+    if x < off {
+        let new = if x <= view_w - chunk { 0.0 } else { (x - chunk).max(0.0) };
+        return Some(new);
+    }
+    if x > off + view_w - 2.0 {
+        return Some(x + chunk - view_w);
+    }
+    None
+}
+
 /// 뷰포트 오른쪽에 남겨 둘 세로 스크롤바 여백 폭(`pinned_vscrollbar`가 그 안에
 /// 그린다). egui 기본 스크롤바와 같은 치수를 쓴다.
 fn vscrollbar_gutter(ui: &egui::Ui) -> f32 {
@@ -2865,47 +2911,81 @@ fn pinned_vscrollbar(
     viewport_h: f32,
 ) {
     let Some(scroll_id) = scroll_id else { return };
-    if content_h <= viewport_h || bar_rect.height() <= 0.0 {
-        return;
-    }
     let ctx = ui.ctx().clone();
     let mut state = egui::scroll_area::State::load(&ctx, scroll_id).unwrap_or_default();
-    let max_off = content_h - viewport_h;
-    let offset = state.offset.y.clamp(0.0, max_off);
+    let id = ui.id().with("pinned_vscrollbar");
+    if let Some(y) = drag_scrollbar(ui, bar_rect, id, true, state.offset.y, content_h, viewport_h) {
+        state.offset.y = y;
+        state.store(&ctx, scroll_id);
+    }
+}
+
+/// 스크롤바 하나(세로 또는 가로)를 `bar_rect`에 그리고, 엄지 드래그/트랙 클릭이
+/// 있었으면 새 offset을 돌려준다. 상태를 소유하지 않는다 — offset을 어디에
+/// 쓸지는 호출측이 정한다(세로: egui `ScrollArea` 상태, 가로: `TextHScroll`).
+/// 내용이 보이는 폭보다 작으면 아무것도 그리지 않는다.
+fn drag_scrollbar(
+    ui: &mut egui::Ui,
+    bar_rect: egui::Rect,
+    id: egui::Id,
+    vertical: bool,
+    offset: f32,
+    content: f32,
+    viewport: f32,
+) -> Option<f32> {
+    let along = |p: egui::Pos2| if vertical { p.y } else { p.x };
+    let bar_len = if vertical { bar_rect.height() } else { bar_rect.width() };
+    if content <= viewport || bar_len <= 0.0 {
+        return None;
+    }
+    let max_off = content - viewport;
+    let offset = offset.clamp(0.0, max_off);
 
     let (bar_w, min_len, outer) = {
         let s = &ui.spacing().scroll;
         (s.bar_width, s.handle_min_length, s.bar_outer_margin)
     };
-    let track = egui::Rect::from_min_max(
-        egui::pos2(bar_rect.right() - outer - bar_w, bar_rect.top()),
-        egui::pos2(bar_rect.right() - outer, bar_rect.bottom()),
-    );
-    let thumb_len = (viewport_h / content_h * track.height())
-        .clamp(min_len.min(track.height()), track.height());
-    let travel = (track.height() - thumb_len).max(0.0);
-    let thumb_top = track.top() + if max_off > 0.0 { offset / max_off * travel } else { 0.0 };
-    let thumb = egui::Rect::from_min_size(egui::pos2(track.left(), thumb_top), egui::vec2(bar_w, thumb_len));
+    // 트랙: 세로면 오른쪽 가장자리, 가로면 아래쪽 가장자리에 붙인다.
+    let track = if vertical {
+        egui::Rect::from_min_max(
+            egui::pos2(bar_rect.right() - outer - bar_w, bar_rect.top()),
+            egui::pos2(bar_rect.right() - outer, bar_rect.bottom()),
+        )
+    } else {
+        egui::Rect::from_min_max(
+            egui::pos2(bar_rect.left(), bar_rect.bottom() - outer - bar_w),
+            egui::pos2(bar_rect.right(), bar_rect.bottom() - outer),
+        )
+    };
+    let track_start = if vertical { track.top() } else { track.left() };
+    let track_len = if vertical { track.height() } else { track.width() };
+    let thumb_len = (viewport / content * track_len).clamp(min_len.min(track_len), track_len);
+    let travel = (track_len - thumb_len).max(0.0);
+    let thumb_start = track_start + offset / max_off * travel;
+    let thumb = if vertical {
+        egui::Rect::from_min_size(egui::pos2(track.left(), thumb_start), egui::vec2(bar_w, thumb_len))
+    } else {
+        egui::Rect::from_min_size(egui::pos2(thumb_start, track.top()), egui::vec2(thumb_len, bar_w))
+    };
 
-    let id = ui.id().with("pinned_vscrollbar");
     let resp = ui.interact(bar_rect, id, egui::Sense::click_and_drag());
-    // 잡은 지점(엄지 위쪽에서 포인터까지)을 드래그 동안 유지한다 — 안 그러면
+    // 잡은 지점(엄지 시작에서 포인터까지)을 드래그 동안 유지한다 — 안 그러면
     // 엄지 가장자리를 잡았을 때 첫 프레임에 엄지가 포인터 중앙으로 튄다.
     // 트랙(엄지 밖)을 눌렀으면 엄지 중앙이 포인터로 오게 한다.
     let grab_id = id.with("grab");
     if resp.drag_started() || resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
-            let grab = if thumb.contains(p) { p.y - thumb.top() } else { thumb_len * 0.5 };
+            let grab = if thumb.contains(p) { along(p) - thumb_start } else { thumb_len * 0.5 };
             ui.data_mut(|d| d.insert_temp(grab_id, grab));
         }
     }
+    let mut out = None;
     if (resp.dragged() || resp.clicked()) && travel > 0.0 {
         if let Some(p) = resp.interact_pointer_pos() {
             let grab: f32 = ui.data(|d| d.get_temp(grab_id)).unwrap_or(thumb_len * 0.5);
-            let frac = ((p.y - grab - track.top()) / travel).clamp(0.0, 1.0);
-            state.offset.y = frac * max_off;
-            state.store(&ctx, scroll_id);
-            ctx.request_repaint();
+            let frac = ((along(p) - grab - track_start) / travel).clamp(0.0, 1.0);
+            out = Some(frac * max_off);
+            ui.ctx().request_repaint();
         }
     }
 
@@ -2920,6 +3000,20 @@ fn pinned_vscrollbar(
     let painter = ui.painter();
     painter.rect_filled(track, bar_w * 0.5, v.extreme_bg_color);
     painter.rect_filled(thumb, bar_w * 0.5, thumb_col);
+    out
+}
+
+/// 드래그 선택 중 포인터가 본문 가장자리 밖으로 나간 거리 → 이번 프레임
+/// 스크롤할 양(px, 부호 포함). 안쪽이면 0. 멀리 나갈수록 빨라지되 상한을
+/// 둔다(한 프레임에 화면을 통째로 건너뛰지 않게).
+fn edge_autoscroll(p: f32, lo: f32, hi: f32, max_step: f32) -> f32 {
+    if p > hi {
+        ((p - hi) * 0.5).clamp(2.0, max_step)
+    } else if p < lo {
+        -((lo - p) * 0.5).clamp(2.0, max_step)
+    } else {
+        0.0
+    }
 }
 
 /// **행 → y 좌표.** `TableBody::rows`가 쓰는 것과 **같은** 식이다
@@ -4596,6 +4690,7 @@ fn build_extracted_doc(
         cell_drag_active: false,
         text_sel: None,
         text_caret: crate::edit::TextPos { line: 0, col: 0 },
+        text_hscroll: TextHScroll::default(),
         text_drag_active: false,
         ime_preview: String::new(),
         pending_column_op: None,
@@ -4675,6 +4770,7 @@ fn hex_document(source: Arc<Source>, path: &Path) -> Document {
         cell_drag_active: false,
         text_sel: None,
         text_caret: crate::edit::TextPos { line: 0, col: 0 },
+        text_hscroll: TextHScroll::default(),
         text_drag_active: false,
         ime_preview: String::new(),
         pending_column_op: None,
@@ -4759,6 +4855,7 @@ fn parquet_document(
         cell_drag_active: false,
         text_sel: None,
         text_caret: crate::edit::TextPos { line: 0, col: 0 },
+        text_hscroll: TextHScroll::default(),
         text_drag_active: false,
         ime_preview: String::new(),
         pending_column_op: None,
@@ -8660,7 +8757,6 @@ fn render_text(
     // Parquet은 표 모드로만 그리므로 여기 오지 않지만, 행 수를 얻는 방법은
     // 한 가지로 통일해 둔다(`doc_line_count`가 세 출처를 모두 안다).
     let total_lines = doc_line_count(doc);
-    let avail_height = ui.available_height();
     // 행 높이는 배율을 탄다 — 상수 ROW_HEIGHT를 직접 쓰면 확대 시 글자가 잘린다.
     let row_h = doc_row_height(doc);
 
@@ -8741,13 +8837,82 @@ fn render_text(
     // 행 간격 — 표 모드와 같은 이유(`scroll_offset_for_row` 주석).
     let spacing_y = ui.spacing().item_spacing.y;
 
-    // 줄 전체 컬럼은 넉넉한 초기폭 + resizable. 긴 줄은 셀 안에서 truncate.
+    // ---- 가로 스크롤 ----
+    // 창보다 긴 줄을 보이게 하되 **라인번호 열은 고정**한다. 그래서 표 전체를
+    // 가로 스크롤 영역으로 감싸지 않고(그러면 라인번호도 밀린다), 표는 창 폭에
+    // 맞춘 채 텍스트 열 안에서만 글자를 `offset`만큼 왼쪽으로 옮겨 그린다.
+    // 캐럿·선택·클릭 위치·IME 창은 모두 줄마다 같은 원점(`origin`)에서
+    // 계산되므로 원점만 옮기면 전부 함께 따라온다.
+    //
+    // 세로 스크롤바는 창 오른쪽, 가로 스크롤바는 텍스트 열 바로 아래에 직접
+    // 그린다(`drag_scrollbar`). 가로 스크롤바 자리는 필요할 때만 뗀다.
+    let full = ui.available_rect_before_wrap();
+    let gutter = vscrollbar_gutter(ui);
+    if doc.text_hscroll.font_size != font_id.size {
+        doc.text_hscroll.measured_w = 0.0;
+        doc.text_hscroll.font_size = font_id.size;
+    }
+    let hbar_h = if doc.text_hscroll.measured_w > doc.text_hscroll.view_w && doc.text_hscroll.view_w > 0.0 {
+        gutter
+    } else {
+        0.0
+    };
+    let table_rect = egui::Rect::from_min_max(
+        full.min,
+        egui::pos2(full.right() - gutter, full.bottom() - hbar_h),
+    );
+    // 표가 차지하는 높이가 곧 본문 계산의 기준이다(가로 스크롤바 자리 제외).
+    let avail_height = table_rect.height();
+    let vbar_rect = egui::Rect::from_min_max(
+        egui::pos2(table_rect.right(), full.top() + row_h + spacing_y),
+        egui::pos2(full.right(), table_rect.bottom()),
+    );
+    // 본문(헤더 아래) 세로 범위 — 드래그 자동 스크롤 판정과 포인터 클램프에 쓴다.
+    let body_top = table_rect.top() + row_h + spacing_y;
+    let body_bottom = table_rect.bottom();
+    // 줄 끝 뒤 여유: 개행 표식(`\r\n` 글리프)과 캐럿이 들어갈 자리.
+    let line_pad = font_id.size * 3.0;
+    // 키 입력으로 캐럿이 움직였으면(지난 프레임) 캐럿이 보이게 가로 offset을
+    // 정한다. 캐럿 줄 폭도 여기서 범위에 넣는다 — 아래 클램프가 범위를 넘는
+    // offset을 잘라 내므로, 범위가 캐럿까지 안 닿았으면 옮겨지지 않는다.
+    if editing && std::mem::take(&mut doc.text_hscroll.follow_caret) {
+        if let Some(line) = doc.edit.as_ref().and_then(|e| e.lines.get(caret.line)) {
+            let g = ui.fonts(|f| f.layout_no_wrap(line.clone(), font_id.clone(), text_color));
+            let col = caret.col.min(line_char_len(line));
+            let cx = g.pos_from_ccursor(egui::text::CCursor::new(col)).min.x;
+            let hs = &mut doc.text_hscroll;
+            hs.measured_w = hs.measured_w.max(g.size().x + line_pad);
+            let chunk = (hs.view_w / 4.0).max(font_id.size * 4.0);
+            if let Some(x) = hscroll_to_show(cx, hs.offset, hs.view_w, chunk) {
+                hs.offset = x;
+            }
+        }
+    }
+    {
+        let hs = &mut doc.text_hscroll;
+        hs.offset = hs.offset.clamp(0.0, (hs.measured_w - hs.view_w).max(0.0));
+    }
+    let hoff = doc.text_hscroll.offset;
+
+    // 표 모드와 같은 통로 — Page Up/Down이 읽을 "화면 첫 행"을 관측한다.
+    // 텍스트 모드는 정렬 permutation이 없어 화면 행 = 논리 행이다.
+    let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
+    // 이번 프레임의 관측값(클로저는 doc을 불변으로만 빌리므로 Cell로 모은다).
+    let widest: Cell<f32> = Cell::new(0.0);
+    let text_col_rect: Cell<Option<egui::Rect>> = Cell::new(None);
+    let inner_scroll_id: Cell<Option<egui::Id>> = Cell::new(None);
+
+    ui.allocate_ui_at_rect(table_rect, |ui| {
+    inner_scroll_id.set(Some(table_scroll_area_id(ui)));
     let mut table = TableBuilder::new(ui)
         .striped(true)
         .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .max_scroll_height(avail_height)
         .column(Column::initial(64.0).at_least(48.0).resizable(true)) // 라인번호 #
-        .column(Column::remainder().at_least(200.0).resizable(true)); // 줄 전체
+        // 줄 전체. 창에 남은 폭을 채운다. 긴 줄은 `hoff`만큼 밀어 그리고 셀
+        // 경계에서 자른다(`clip`).
+        .column(Column::remainder().at_least(200.0).clip(true));
     if let Some(row) = scroll_to {
         // 텍스트 모드는 논리 행이 곧 화면 행이라 전체 줄 수로 클램프한다.
         let row = row.min(total_lines.saturating_sub(1));
@@ -8759,10 +8924,6 @@ fn render_text(
             (avail_height - row_h).max(0.0),
         ));
     }
-
-    // 표 모드와 같은 통로 — Page Up/Down이 읽을 "화면 첫 행"을 관측한다.
-    // 텍스트 모드는 정렬 permutation이 없어 화면 행 = 논리 행이다.
-    let min_drawn_row: Cell<Option<usize>> = Cell::new(None);
 
     table
         .header(row_h, |mut header| {
@@ -8793,6 +8954,7 @@ fn render_text(
                 });
                 let line = logical_line(doc, logical).unwrap_or_default();
                 row.col(|ui| {
+                    text_col_rect.set(Some(ui.max_rect()));
                     // ---- 뷰 전용 모드 ----
                     if !editing {
                         // 검색 중이 아니면 기존 `Label` 경로 그대로(픽셀 단위 회귀
@@ -8805,8 +8967,14 @@ fn render_text(
                             // 레이아웃(wrap·truncate·Body 스타일)과 어긋날 수 있는데,
                             // 그 위험 없이 탭 칸 좌표를 정확히 얻는 유일한 방법이다.
                             let tabs = tab_positions(&line);
+                            // 가로 스크롤이 있으므로 자르지 않고 원래 폭으로 둔 뒤,
+                            // `hoff`만큼 왼쪽으로 옮겨 셀 안에서만 그린다.
+                            let cell = ui.max_rect();
                             let (pos, galley, resp) =
-                                egui::Label::new(line).truncate().layout_in_ui(ui);
+                                egui::Label::new(line).extend().layout_in_ui(ui);
+                            widest.set(widest.get().max(galley.size().x));
+                            let pos = pos - egui::vec2(hoff, 0.0);
+                            let painter = ui.painter().with_clip_rect(cell);
                             // 탭 배경 → 글자 순서로 그려야 배경이 글자를 덮지 않는다.
                             if !tabs.is_empty() {
                                 let x_of = |c: usize| -> f32 {
@@ -8816,18 +8984,14 @@ fn render_text(
                                             .min
                                             .x
                                 };
-                                paint_tab_shades(
-                                    &ui.painter().with_clip_rect(resp.rect),
-                                    resp.rect,
-                                    &x_of,
-                                    &tabs,
-                                );
+                                paint_tab_shades(&painter, resp.rect, &x_of, &tabs);
                             }
-                            ui.painter().galley(pos, galley, text_color);
+                            let end_x = pos.x + galley.size().x;
+                            painter.galley(pos, galley, text_color);
                             let ending = line_ending_for_row(doc, logical);
                             paint_line_ending(
-                                ui.painter(),
-                                egui::pos2(resp.rect.right(), resp.rect.top()),
+                                &painter,
+                                egui::pos2(end_x, resp.rect.top()),
                                 ending,
                                 &font_id,
                                 ui,
@@ -8839,8 +9003,9 @@ fn render_text(
                         let galley = ui.fonts(|f| {
                             f.layout_no_wrap(line.clone(), font_id.clone(), text_color)
                         });
+                        widest.set(widest.get().max(galley.size().x));
                         let origin = egui::pos2(
-                            cell_rect.left(),
+                            cell_rect.left() - hoff,
                             cell_rect.center().y - galley.size().y * 0.5,
                         );
                         let x_of = |c: usize| -> f32 {
@@ -8881,9 +9046,12 @@ fn render_text(
                     let galley = ui.fonts(|f| {
                         f.layout_no_wrap(line.clone(), font_id.clone(), text_color)
                     });
-                    // 셀 왼쪽 위에 세로 중앙 정렬해 그린다.
+                    widest.set(widest.get().max(galley.size().x));
+                    // 셀 왼쪽 위에 세로 중앙 정렬해 그린다. 가로는 `hoff`만큼 민다 —
+                    // 캐럿·선택·클릭 역매핑(`pos_at_pointer`)이 모두 이 원점을 쓰므로
+                    // 여기 한 곳만 옮기면 된다.
                     let origin = egui::pos2(
-                        cell_rect.left(),
+                        cell_rect.left() - hoff,
                         cell_rect.center().y - galley.size().y * 0.5,
                     );
                     // char 인덱스 → 셀 좌표 x.
@@ -9044,12 +9212,22 @@ fn render_text(
                         }
                     }
 
-                    // 드래그 중 확장: 포인터가 이 줄 위 + 줄에서 시작된 드래그.
-                    // 다른 줄로 넘어가는 확장은 원 위젯이 포인터를 캡처하므로
-                    // contains_pointer()로 감지한다(표 모드와 동일).
-                    if drag_active && resp.contains_pointer() {
+                    // 드래그 중 확장. 포인터를 **본문 안으로 끌어온 뒤**(텍스트 열
+                    // 가로 범위 × 본문 세로 범위) 그 y가 이 줄에 들면 끝점으로 삼는다.
+                    // 포인터가 창 밖(오른쪽·아래 등)으로 나가도 선택이 가장자리까지
+                    // 이어지고, 그동안 아래 자동 스크롤이 화면을 민다. 예전처럼
+                    // `contains_pointer()`로만 보면 포인터가 셀 밖에 나가는 순간
+                    // 끝점 갱신이 멈췄다.
+                    if drag_active {
                         if let Some(pp) = ui.input(|i| i.pointer.latest_pos()) {
-                            drag_head.set(Some(pos_at_pointer(pp)));
+                            let cp = egui::pos2(
+                                pp.x.clamp(cell_rect.left(), cell_rect.right()),
+                                pp.y.clamp(body_top, (body_bottom - 1.0).max(body_top)),
+                            );
+                            let half_gap = spacing_y * 0.5;
+                            if cp.y >= resp.rect.top() - half_gap && cp.y < resp.rect.bottom() + half_gap {
+                                drag_head.set(Some(pos_at_pointer(cp)));
+                            }
                         }
                     }
 
@@ -9099,8 +9277,50 @@ fn render_text(
                 });
             });
         });
+    });
+    pinned_vscrollbar(
+        ui,
+        vbar_rect,
+        inner_scroll_id.get(),
+        total_lines as f32 * (row_h + spacing_y),
+        (body_bottom - body_top).max(0.0),
+    );
 
     // ---- 클로저 종료 → doc 가변 대여 가능 ----
+
+    // 가로 스크롤 관측값 + 가로 스크롤바 + Shift+휠. 뷰 모드도 필요하므로
+    // 아래 조기 반환보다 먼저 한다. 범위가 넓어졌으면 한 프레임 더 그린다.
+    {
+        let hs = &mut doc.text_hscroll;
+        if let Some(r) = text_col_rect.get() {
+            hs.view_w = r.width();
+        }
+        let w = widest.get() + line_pad;
+        if w > hs.measured_w {
+            hs.measured_w = w;
+            ui.ctx().request_repaint();
+        }
+        if let Some(r) = text_col_rect.get() {
+            let hbar = egui::Rect::from_min_max(
+                egui::pos2(r.left(), table_rect.bottom()),
+                egui::pos2(r.right(), table_rect.bottom() + hbar_h),
+            );
+            let id = ui.id().with("text_hscrollbar");
+            if let Some(x) = drag_scrollbar(ui, hbar, id, false, hs.offset, hs.measured_w, hs.view_w) {
+                hs.offset = x;
+            }
+        }
+        // Shift+휠(egui가 가로 스크롤로 바꿔 준다)과 터치패드 가로 스크롤.
+        // 표 안쪽 세로 ScrollArea는 세로 축만 소비하므로 가로는 여기 남아 있다.
+        if ui.rect_contains_pointer(table_rect) {
+            let dx = ui.input(|i| i.smooth_scroll_delta.x);
+            if dx != 0.0 {
+                hs.offset -= dx;
+                ui.input_mut(|i| i.smooth_scroll_delta.x = 0.0);
+            }
+        }
+        hs.offset = hs.offset.clamp(0.0, (hs.measured_w - hs.view_w).max(0.0));
+    }
 
     // Page Up/Down이 읽을 관측값. 표 모드와 같은 이유로 아래 조기 반환보다
     // **먼저** 기록한다 — 뷰 모드에서도 페이지 이동이 되어야 한다.
@@ -9145,9 +9365,43 @@ fn render_text(
         doc.text_sel = if a == b { None } else { Some((a, b)) };
     }
 
+    // 2-c) 드래그 자동 스크롤. 선택하며 포인터를 본문 밖으로 끌면 그쪽으로
+    //      화면을 민다(가로: `TextHScroll::offset`, 세로: 표 안쪽 ScrollArea).
+    //      포인터가 멈춰 있어도 계속 굴러가야 하므로 다시 그리기를 요청한다.
+    if drag_active {
+        if let (Some(p), Some(col)) = (ui.input(|i| i.pointer.latest_pos()), text_col_rect.get()) {
+            let step = row_h * 3.0;
+            let dx = edge_autoscroll(p.x, col.left(), col.right(), step * 2.0);
+            let dy = edge_autoscroll(p.y, body_top, body_bottom, step);
+            if dx != 0.0 {
+                let hs = &mut doc.text_hscroll;
+                hs.offset = (hs.offset + dx).clamp(0.0, (hs.measured_w - hs.view_w).max(0.0));
+            }
+            if dy != 0.0 {
+                if let Some(id) = inner_scroll_id.get() {
+                    let ctx = ui.ctx().clone();
+                    let mut st = egui::scroll_area::State::load(&ctx, id).unwrap_or_default();
+                    st.offset.y = (st.offset.y + dy).max(0.0);
+                    st.store(&ctx, id);
+                }
+            }
+            if dx != 0.0 || dy != 0.0 {
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
     // 3) 키 입력 인텐트 적용.
+    // 캐럿이 키 입력으로 움직였으면 다음 프레임에 가로로 따라간다(End가 화면을
+    // 줄 끝으로 옮기지 않던 버그). 마우스·우클릭으로 옮긴 캐럿은 대상이
+    // 아니다 — 이미 보이는 자리이거나, 우클릭 메뉴처럼 줄 끝으로 가도
+    // 화면이 따라가면 안 되는 경우다.
+    let caret_before_keys = doc.text_caret;
     for intent in intents {
         apply_text_intent(ui, doc, clipboard, intent);
+    }
+    if doc.text_caret != caret_before_keys {
+        doc.text_hscroll.follow_caret = true;
     }
 
     // 4) 컨텍스트 메뉴 동작. 우클릭 줄이 현재 선택 밖이면 캐럿만 그 줄로 옮긴다
@@ -18493,6 +18747,163 @@ mod tests {
             "Center 정렬 스크롤 후 한 프레임 만에 첫 행이 {want} 근처여야 한다 (got {})",
             doc.first_visible_row
         );
+    }
+
+    /// 캐럿이 보이는 범위 안이면 가로 offset을 건드리지 않는다.
+    #[test]
+    fn hscroll_to_show_keeps_offset_when_caret_visible() {
+        assert_eq!(hscroll_to_show(100.0, 0.0, 500.0, 100.0), None);
+        assert_eq!(hscroll_to_show(700.0, 400.0, 500.0, 100.0), None);
+    }
+
+    /// 오른쪽으로 넘어가면(End, 타이핑) 캐럿 뒤에 chunk만큼 여유를 두고 옮긴다.
+    #[test]
+    fn hscroll_to_show_scrolls_right_past_edge_with_margin() {
+        let new = hscroll_to_show(2000.0, 0.0, 500.0, 100.0).unwrap();
+        assert_eq!(new, 2000.0 + 100.0 - 500.0);
+        // 옮긴 뒤에는 캐럿이 보인다.
+        assert!(2000.0 >= new && 2000.0 <= new + 500.0);
+    }
+
+    /// 왼쪽으로 넘어갔는데 첫 화면에 들어가면(Home) 0으로 돌아간다.
+    #[test]
+    fn hscroll_to_show_snaps_home_to_zero() {
+        assert_eq!(hscroll_to_show(70.0, 1500.0, 500.0, 100.0), Some(0.0));
+    }
+
+    /// 왼쪽으로 넘어갔지만 여전히 먼 곳이면 chunk만큼 앞을 보여 준다.
+    #[test]
+    fn hscroll_to_show_scrolls_left_with_margin() {
+        assert_eq!(hscroll_to_show(1200.0, 1500.0, 500.0, 100.0), Some(1100.0));
+    }
+
+    /// 포인터가 가장자리 안쪽이면 0, 밖이면 부호가 맞고 상한이 있다.
+    #[test]
+    fn edge_autoscroll_direction_and_cap() {
+        assert_eq!(edge_autoscroll(50.0, 0.0, 100.0, 30.0), 0.0);
+        assert!(edge_autoscroll(110.0, 0.0, 100.0, 30.0) > 0.0);
+        assert!(edge_autoscroll(-10.0, 0.0, 100.0, 30.0) < 0.0);
+        assert_eq!(edge_autoscroll(10_000.0, 0.0, 100.0, 30.0), 30.0);
+        // 가장자리를 겨우 넘어도 최소 속도는 있다(멈춘 것처럼 보이지 않게).
+        assert_eq!(edge_autoscroll(100.5, 0.0, 100.0, 30.0), 2.0);
+    }
+
+    /// 긴 줄 위에서 눌러 드래그를 시작하고 포인터를 텍스트 열 오른쪽 밖으로
+    /// 끌어 두면, 포인터가 멈춰 있어도 매 프레임 가로로 굴러가고 선택 끝점이
+    /// 따라 늘어나야 한다. 아래로 끌면 세로로도 굴러가야 한다.
+    #[test]
+    fn text_drag_past_edges_autoscrolls_both_axes() {
+        let long = "y".repeat(3000);
+        let mut content = String::new();
+        for _ in 0..200 {
+            content.push_str(&long);
+            content.push('\n');
+        }
+        let (mut app, _d) = edit_doc(content.as_bytes(), false);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let frame = |app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let doc = app.doc_mut().unwrap();
+                    let mut clip = String::new();
+                    render_text(ui, doc, 1, &mut clip, false, crate::i18n::Lang::En);
+                });
+            });
+        };
+        let btn = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // 셋째 줄쯤(헤더 아래) 텍스트 열 안에서 누른다.
+        let start = egui::pos2(200.0, 80.0);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(start), btn(start, true)]);
+        frame(&mut app, &ctx, vec![]);
+        // 오른쪽 가장자리 너머로 끌어 두고 몇 프레임 지나게 한다.
+        let right = egui::pos2(799.0, 80.0);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(right)]);
+        for _ in 0..10 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let doc = app.doc().unwrap();
+        let off_after_right = doc.text_hscroll.offset;
+        assert!(off_after_right > 0.0, "오른쪽 밖으로 끌면 가로로 굴러가야 한다");
+        let (_, head) = doc.text_sel.expect("드래그로 선택이 생겨야 한다");
+        let head_col_right = head.col;
+        assert!(head_col_right > 50, "선택 끝점이 가로 스크롤을 따라 늘어나야 한다, got {head_col_right}");
+        // 더 지나면 더 굴러간다(포인터가 멈춰 있어도).
+        for _ in 0..10 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.doc().unwrap().text_hscroll.offset > off_after_right, "멈춘 포인터에도 계속 굴러가야 한다");
+
+        // 아래 가장자리 너머로 끌면 세로로 굴러가 선택 끝 줄이 화면 밖 줄까지 간다.
+        let below = egui::pos2(400.0, 599.0);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(below)]);
+        for _ in 0..40 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let doc = app.doc().unwrap();
+        let (_, head) = doc.text_sel.unwrap();
+        assert!(
+            head.line > doc.visible_rows,
+            "아래로 끌면 세로로 굴러가 첫 화면 밖 줄까지 선택돼야 한다, got line {} (visible {})",
+            head.line,
+            doc.visible_rows
+        );
+        frame(&mut app, &ctx, vec![btn(below, false)]);
+    }
+
+    /// 텍스트 모드 편집 문서에서 창보다 긴 줄에 End를 누르면 가로 offset이
+    /// 캐럿 쪽으로 옮겨지고, Home을 누르면 0으로 돌아와야 한다(보고된 버그).
+    #[test]
+    fn text_mode_end_key_scrolls_horizontally_and_home_returns() {
+        let long = "x".repeat(2000);
+        let (mut app, _d) = edit_doc(format!("{long}\nshort\n").as_bytes(), false);
+        let ctx = egui::Context::default();
+        let frame = |app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let doc = app.doc_mut().unwrap();
+                    let mut clip = String::new();
+                    render_text(ui, doc, 1, &mut clip, false, crate::i18n::Lang::En);
+                });
+            });
+        };
+        let key = |k: egui::Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        // 첫 프레임: 레이아웃 관측(view_w, col_x0).
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.doc().unwrap().text_hscroll.offset, 0.0);
+        // End → 다음 프레임에 offset이 줄 끝 쪽으로.
+        frame(&mut app, &ctx, vec![key(egui::Key::End)]);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let hs = app.doc().unwrap().text_hscroll;
+        assert_eq!(app.doc().unwrap().text_caret.col, 2000, "End가 캐럿을 줄 끝으로");
+        assert!(hs.offset > 1000.0, "End 뒤 가로 offset이 줄 끝 쪽이어야 한다, got {}", hs.offset);
+        assert!(hs.measured_w > hs.view_w, "긴 줄 폭이 스크롤 범위에 반영돼야 한다");
+        // Home → 0으로.
+        frame(&mut app, &ctx, vec![key(egui::Key::Home)]);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.doc().unwrap().text_hscroll.offset, 0.0, "Home 뒤 offset 0");
     }
 
     /// `table_scroll_area_id`가 계산한 id로 실제 `TableBuilder`의 세로

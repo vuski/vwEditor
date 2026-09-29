@@ -28,7 +28,7 @@ parquet 조회도 가능합니다.
 > 다른 백신들의 판정을 비교해 보세요.
 
 > 개인 도구로 만들어 쓰는 중입니다. Windows에서 실사용하며 다듬었고,
-> 876개 테스트가 붙어 있습니다. macOS·Linux는 빌드는 되지만
+> 883개 테스트가 붙어 있습니다. macOS·Linux는 빌드는 되지만
 > **실기 검증을 못 했습니다** — 아래 [플랫폼 지원](#플랫폼-지원)을 참고하세요.
 
 ## 기능
@@ -42,7 +42,8 @@ parquet 조회도 가능합니다.
 - **컬럼 필터** — 헤더의 ▾로 엑셀식 자동 필터. 값 체크박스, 포함 검색, 숫자 범위(최소~최대).
   여러 컬럼은 AND로 묶이고, 정렬과 함께 쓰면 필터된 행 안에서만 정렬합니다.
   스캔은 셀 값을 복사하지 않고 mmap을 그대로 읽습니다.
-- **가로 스크롤** — 컬럼이 많아도 잘리지 않습니다. 세로 스크롤바는 항상 창 오른쪽에 붙어 있습니다.
+- **가로 스크롤** — 컬럼이 많거나 줄이 길어도 잘리지 않습니다. 텍스트 모드에서는 줄 번호가 고정되고,
+  캐럿(End·Home·타이핑)과 드래그 선택을 따라 화면이 가로·세로로 움직입니다. Shift+휠로도 가로 스크롤됩니다.
 - **편집·저장** — 인코딩·개행(CRLF/LF)·BOM을 골라 저장합니다. Undo/Redo.
 - **Hex 모드** — 바이너리 파일을 16진수로 봅니다(읽기 전용).
 - **Parquet / GeoParquet** — 읽기 전용. geometry 컬럼은 `POINT(127.02 37.51)`,
@@ -131,7 +132,7 @@ sudo pacman -S noto-fonts-cjk
 ## 개발
 
 ```powershell
-cargo test              # 876개
+cargo test              # 883개
 cargo clippy --all-targets
 cargo build --release
 ```
@@ -180,7 +181,7 @@ line positions in the background. The scrollbar grows as indexing progresses.
 > [VirusTotal](https://www.virustotal.com) and compare verdicts across engines.
 
 > This is a personal tool I built for my own use. It has been refined through
-> daily use on Windows and carries 876 tests. macOS and Linux builds compile
+> daily use on Windows and carries 883 tests. macOS and Linux builds compile
 > but **have not been verified on real hardware** — see
 > [Platform Support](#platform-support) below.
 
@@ -196,8 +197,9 @@ line positions in the background. The scrollbar grows as indexing progresses.
   contains search, and a numeric range (min–max). Multiple columns combine with AND; combined
   with sorting, only the filtered rows are sorted. The scan reads the mmap in place without
   copying cell values.
-- **Horizontal scrolling** — wide files are never clipped. The vertical scrollbar stays pinned
-  to the right edge of the window.
+- **Horizontal scrolling** — wide files and long lines are never clipped. In text mode the line
+  numbers stay pinned, and the view follows the caret (End, Home, typing) and drag selection in
+  both directions. Shift+wheel scrolls horizontally.
 - **Edit & save** — choose encoding, line ending (CRLF/LF), and BOM when saving. Undo/redo.
 - **Hex mode** — view binary files as hexadecimal (read-only).
 - **Parquet / GeoParquet** — read-only. Geometry columns are summarized as
@@ -294,7 +296,7 @@ been able to verify them in those environments.
 ## Development
 
 ```powershell
-cargo test              # 876 tests
+cargo test              # 883 tests
 cargo clippy --all-targets
 cargo build --release
 ```
