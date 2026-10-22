@@ -100,6 +100,16 @@ pub struct Document {
     /// 필요하다 — egui의 primary_down은 전역 상태라 누름이 어디서 시작됐는지
     /// 알 수 없고, is_pointer_button_down_on()은 우클릭에도 참이다.
     pub text_drag_active: bool,
+    /// 줄 번호(`#`) 칸에서 만든 행 선택 (앵커 행, 끝 행). 표·텍스트 모드 공용.
+    /// Shift+클릭이 앵커를 이어받을 때 쓴다 — 지금 선택이 이 값으로 만든
+    /// 선택과 다르면(셀·텍스트 클릭 등으로 바뀌었으면) 무시한다.
+    pub gutter_sel: Option<(usize, usize)>,
+    /// `#` 칸에서 누른 채 끄는 중인지. 버튼을 떼면 꺼진다.
+    pub gutter_drag_active: bool,
+    /// Ctrl+클릭으로 하나씩 고른 행(논리 행). 비어 있지 않으면 이것이 곧
+    /// 선택이고, 그동안 `text_sel`/`cell_sel`은 None이다. 다른 선택이 생기면
+    /// 렌더 시작에서 비운다(`clear_picks_if_superseded`).
+    pub picked_rows: std::collections::BTreeSet<usize>,
     /// IME 조합 중인 글자(ㅎ → 하 → 한). **버퍼가 아니라 화면 전용**이라
     /// 되돌리기·dirty·저장 어디에도 들어가지 않는다. 확정되면 비워지고 그
     /// 글자는 `Insert`로 버퍼에 들어간다(`collect_text_intents` 참조).
@@ -750,6 +760,9 @@ impl App {
             text_caret: crate::edit::TextPos { line: 0, col: 0 },
             text_hscroll: TextHScroll::default(),
             text_drag_active: false,
+            gutter_sel: None,
+            gutter_drag_active: false,
+            picked_rows: Default::default(),
             ime_preview: String::new(),
             pending_column_op: None,
             // 찾기 상태 초기값. `FindOptions`가 `Default`를 구현해 두어
@@ -1051,19 +1064,147 @@ fn paint_header_cell(ui: &egui::Ui, rect: egui::Rect, filled: egui::Color32) {
 
 /// 라인번호 칸: 배경을 살짝 구분하고 격자선을 긋는다. 번호는 오른쪽 정렬 +
 /// 흐린 색으로 그려 "데이터가 아닌 축"으로 읽히게 한다(엑셀 행 머리글과 같은 역할).
-fn paint_line_number_cell(ui: &mut egui::Ui, rect: egui::Rect, text: String) {
-    ui.painter().rect_filled(
-        gapless_cell_rect(ui, rect),
-        0.0,
-        crate::theme::line_number_bg(),
-    );
+///
+/// `selected`면 선택된 컬럼 헤더와 같은 파랑 배경 + 진한 글자로 그린다. 엑셀의
+/// 행 머리글처럼 "이 행이 선택에 들어 있다"를 본문 음영보다 확실히 보여 준다.
+fn paint_line_number_cell(ui: &mut egui::Ui, rect: egui::Rect, text: String, selected: bool) {
+    let (bg, fg) = if selected {
+        (header_sel_color(), ui.visuals().strong_text_color())
+    } else {
+        (crate::theme::line_number_bg(), crate::theme::line_number_fg())
+    };
+    ui.painter().rect_filled(gapless_cell_rect(ui, rect), 0.0, bg);
     paint_cell_grid(ui, rect);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.add(
-            egui::Label::new(egui::RichText::new(text).color(crate::theme::line_number_fg()))
-                .truncate(),
-        );
+        ui.add(egui::Label::new(egui::RichText::new(text).color(fg)).truncate());
     });
+}
+
+/// `#` 칸 행 선택 (앵커 행, 끝 행)을 텍스트 선택 (앵커, 캐럿)으로 바꾼다.
+/// 행 [lo..=hi]를 **개행까지** 덮는다(다음 줄 첫 칸까지). 마지막 줄은 개행이
+/// 없으니 줄 끝까지. 위로 끌었으면 캐럿이 위쪽 줄 첫 칸에 서도록 뒤집는다.
+fn gutter_text_sel(
+    anchor: usize,
+    head: usize,
+    lines: &[String],
+) -> (crate::edit::TextPos, crate::edit::TextPos) {
+    use crate::edit::TextPos;
+    let last = lines.len().saturating_sub(1);
+    let (anchor, head) = (anchor.min(last), head.min(last));
+    let start = |l: usize| TextPos { line: l, col: 0 };
+    let end = |l: usize| {
+        if l < last {
+            TextPos { line: l + 1, col: 0 }
+        } else {
+            TextPos { line: l, col: lines.get(l).map_or(0, |s| line_char_len(s)) }
+        }
+    };
+    if head >= anchor {
+        (start(anchor), end(head))
+    } else {
+        (end(anchor), start(head))
+    }
+}
+
+/// `#` 칸 드래그 중 포인터 높이. 본문 세로 범위 안으로 끌어온다 — 포인터가
+/// 표 위·아래로 나가도 가장자리 줄을 끝으로 삼고, 그동안 자동 스크롤이 민다.
+/// 가로는 보지 않는다(줄 번호 칸 밖 오른쪽으로 나가도 행 선택은 이어진다).
+fn gutter_pointer_y(ui: &egui::Ui, dragging: bool, body_top: f32, body_bottom: f32) -> Option<f32> {
+    if !dragging {
+        return None;
+    }
+    ui.input(|i| i.pointer.latest_pos())
+        .map(|p| p.y.clamp(body_top, (body_bottom - 1.0).max(body_top)))
+}
+
+/// 높이 `y`가 이 행(`rect`)에 드는가. 행 사이 간격은 반씩 나눠 위아래 행에 준다.
+fn gutter_row_hit(y: f32, rect: egui::Rect, spacing_y: f32) -> bool {
+    let half_gap = spacing_y * 0.5;
+    y >= rect.top() - half_gap && y < rect.bottom() + half_gap
+}
+
+/// `#` 칸 Shift+클릭의 앵커 행. 지금 선택이 `#` 칸에서 만든 그대로면 그
+/// 앵커를 잇고(`made_by_gutter`), 아니면 지금 선택의 앵커 행(`sel_anchor_row`)을,
+/// 그것도 없으면 클릭한 행을 쓴다.
+fn gutter_shift_anchor(
+    gutter_sel: Option<(usize, usize)>,
+    made_by_gutter: bool,
+    sel_anchor_row: Option<usize>,
+    clicked: usize,
+) -> usize {
+    match gutter_sel {
+        Some((a, _)) if made_by_gutter => a,
+        _ => sel_anchor_row.unwrap_or(clicked),
+    }
+}
+
+/// Ctrl+클릭으로 행 하나를 고르거나 빼고 새 목록을 돌려준다. 고른 행이 없던
+/// 상태에서 시작하면 지금의 `#` 행 선택(`seed`, 정규화 전 (앵커, 끝))을 먼저
+/// 담는다 — 엑셀처럼 "드래그로 고른 구간 + Ctrl로 하나 더"가 된다.
+fn toggle_picked_row(
+    picked: &std::collections::BTreeSet<usize>,
+    seed: Option<(usize, usize)>,
+    row: usize,
+) -> std::collections::BTreeSet<usize> {
+    let mut out = picked.clone();
+    if out.is_empty() {
+        if let Some((a, b)) = seed {
+            out.extend(a.min(b)..=a.max(b));
+        }
+    }
+    if !out.remove(&row) {
+        out.insert(row);
+    }
+    out
+}
+
+/// 고른 행들을 지우고 되돌리기 한 단계를 쌓는다. 떨어진 행들이라 연속 구간마다
+/// `ReinsertRemoved`를 만들어 `Batch`로 묶는다. **오름차순**으로 담아야 한다 —
+/// 앞 구간이 먼저 되살아나야 뒤 구간의 원래 인덱스가 맞는다. 지우기는 뒤에서부터
+/// 해야 인덱스가 밀리지 않는다. 지운 첫 행 번호를 돌려준다(없으면 None).
+fn delete_picked_rows(
+    e: &mut crate::edit::EditBuffer,
+    picked: &std::collections::BTreeSet<usize>,
+) -> Option<usize> {
+    use crate::edit::EditOp;
+    let rows: Vec<usize> = picked.iter().copied().filter(|&r| r < e.lines.len()).collect();
+    let first = *rows.first()?;
+    let mut ops = Vec::new();
+    // 전부 지우면 `remove_row`가 빈 줄 하나를 남긴다. 되돌릴 때 그 줄을 먼저
+    // 치워야 한 줄이 늘지 않는다(`DeleteRows`와 같은 이유).
+    if rows.len() == e.lines.len() {
+        ops.push(EditOp::RemoveInserted { at: 0, count: 1 });
+    }
+    let mut i = 0;
+    while i < rows.len() {
+        let mut j = i;
+        while j + 1 < rows.len() && rows[j + 1] == rows[j] + 1 {
+            j += 1;
+        }
+        ops.push(EditOp::ReinsertRemoved {
+            at: rows[i],
+            lines: rows[i..=j].iter().map(|&r| e.lines[r].clone()).collect(),
+        });
+        i = j + 1;
+    }
+    e.undo.push(if ops.len() == 1 { ops.pop().unwrap() } else { EditOp::Batch(ops) });
+    for &r in rows.iter().rev() {
+        crate::edit::remove_row(&mut e.lines, r);
+    }
+    e.dirty = true;
+    Some(first)
+}
+
+/// 고른 행들의 텍스트. 각 줄 뒤에 개행을 붙인다(`#` 클릭 선택의 복사와 같은 모양).
+fn picked_rows_text(lines: &[String], picked: &std::collections::BTreeSet<usize>) -> String {
+    let mut out = String::new();
+    for &r in picked {
+        if let Some(l) = lines.get(r) {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// 논리 행 번호(logical)에 해당하는 줄을 mmap offset으로 조회해 디코딩·개행
@@ -1353,6 +1494,9 @@ pub fn enter_edit_mode(doc: &mut Document) {
     doc.text_sel = None;
     doc.text_caret = crate::edit::TextPos { line: 0, col: 0 };
     doc.text_drag_active = false;
+    doc.gutter_sel = None;
+    doc.gutter_drag_active = false;
+    doc.picked_rows.clear();
     doc.pending_column_op = None;
     // 검사의 **바탕**이 mmap에서 편집 버퍼로 바뀐다. 개정 번호로는 못 잡는다 —
     // 새 `EditBuffer`의 revision은 0이고 뷰 모드의 `doc_revision`도 0이라
@@ -1417,6 +1561,9 @@ pub fn exit_edit_mode(doc: &mut Document) {
     doc.cell_drag_active = false;
     doc.text_sel = None;
     doc.text_drag_active = false;
+    doc.gutter_sel = None;
+    doc.gutter_drag_active = false;
+    doc.picked_rows.clear();
     // 편집 버퍼가 사라지면 대기 중인 컬럼 연산도 무의미하다.
     doc.pending_column_op = None;
     // 검사의 바탕이 편집 버퍼에서 mmap으로 되돌아간다. 개정 번호 비교로도
@@ -2580,6 +2727,9 @@ fn undo_once(doc: &mut Document) {
         .map(|(a, b)| (clamp_pos(&e.lines, a), clamp_pos(&e.lines, b)))
         .filter(|(a, b)| a != b);
     doc.text_drag_active = false;
+    doc.gutter_sel = None;
+    doc.gutter_drag_active = false;
+    doc.picked_rows.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -4692,6 +4842,9 @@ fn build_extracted_doc(
         text_caret: crate::edit::TextPos { line: 0, col: 0 },
         text_hscroll: TextHScroll::default(),
         text_drag_active: false,
+        gutter_sel: None,
+        gutter_drag_active: false,
+        picked_rows: Default::default(),
         ime_preview: String::new(),
         pending_column_op: None,
         // 찾기 패널은 새 탭에서 닫힌 채 시작한다. 검색어/옵션과 하이라이트는
@@ -4772,6 +4925,9 @@ fn hex_document(source: Arc<Source>, path: &Path) -> Document {
         text_caret: crate::edit::TextPos { line: 0, col: 0 },
         text_hscroll: TextHScroll::default(),
         text_drag_active: false,
+        gutter_sel: None,
+        gutter_drag_active: false,
+        picked_rows: Default::default(),
         ime_preview: String::new(),
         pending_column_op: None,
         show_find: false,
@@ -4857,6 +5013,9 @@ fn parquet_document(
         text_caret: crate::edit::TextPos { line: 0, col: 0 },
         text_hscroll: TextHScroll::default(),
         text_drag_active: false,
+        gutter_sel: None,
+        gutter_drag_active: false,
+        picked_rows: Default::default(),
         ime_preview: String::new(),
         pending_column_op: None,
         show_find: false,
@@ -6960,6 +7119,8 @@ fn apply_edit_sort(doc: &mut Document, specs: &[SortSpec], delim: u8, data_start
     doc.cell_edit_text.clear();
     doc.cell_sel = None;
     doc.cell_drag_active = false;
+    doc.gutter_sel = None;
+    doc.picked_rows.clear();
     // 편집 모드 정렬은 permutation이 남지 않는다(이미 lines에 반영됨).
     doc.sort = None;
     doc.sort_job = None;
@@ -7442,6 +7603,16 @@ fn render_table(
     // 이전 프레임까지 이어져 온 "셀에서 시작된 드래그" 상태. 버튼이 떼어진
     // 프레임부터는 무조건 꺼진 것으로 본다.
     let drag_active = doc.cell_drag_active && primary_down;
+    // 줄 번호(`#`) 칸 상호작용 — `render_text`와 같은 규율이다(그쪽 주석 참조).
+    // Ctrl로 고른 행은 셀 선택이 생기면 자리를 내준다.
+    if doc.cell_sel.is_some() {
+        doc.picked_rows.clear();
+    }
+    let picked = doc.picked_rows.clone();
+    let ctrl_down = ui.input(|i| i.modifiers.ctrl);
+    let gutter_dragging = doc.gutter_drag_active && primary_down;
+    let gutter_press: Cell<Option<usize>> = Cell::new(None);
+    let gutter_head: Cell<Option<usize>> = Cell::new(None);
 
     // ---- 키보드 단축키(Ctrl+C/X/V, Delete) ----
     // 텍스트 모드(`render_text`)와 같은 규율:
@@ -7518,6 +7689,10 @@ fn render_table(
     let gutter = vscrollbar_gutter(ui);
     let table_rect =
         egui::Rect::from_min_max(full.min, egui::pos2(full.right() - gutter, full.bottom()));
+    // 본문(헤더 아래) 세로 범위 — `#` 칸 드래그의 포인터 클램프·자동 스크롤에 쓴다.
+    let body_top = table_rect.top() + row_h + spacing_y;
+    let body_bottom = table_rect.bottom();
+    let gutter_ptr_y = gutter_pointer_y(ui, gutter_dragging, body_top, body_bottom);
     // 스크롤바는 헤더 한 줄 아래(본문 구간)만 차지한다.
     let bar_rect = egui::Rect::from_min_max(
         egui::pos2(table_rect.right(), full.top() + row_h + spacing_y),
@@ -7705,7 +7880,26 @@ fn render_table(
                 // 아니라 보이는 순서를 매겨 스크롤 위치 감각을 유지한다.
                 row.col(|ui| {
                     let rect = ui.max_rect();
-                    paint_line_number_cell(ui, rect, format!("{line_no}"));
+                    // 선택 사각형이 걸친 행(고른 행 포함)은 번호 칸도 칠한다.
+                    let selected = logical.is_some_and(|l| {
+                        picked.contains(&l)
+                            || cur_sel.is_some_and(|s| {
+                                let (r0, _, r1, _) = normalize_rect(s);
+                                (r0..=r1).contains(&l)
+                            })
+                    });
+                    paint_line_number_cell(ui, rect, format!("{line_no}"), selected);
+                    // 클릭 → 한 행, 드래그 → 여러 행, Shift → 앵커 행부터,
+                    // Ctrl → 한 행씩 담기/빼기. 적용은 클로저 밖에서.
+                    if let (true, Some(l)) = (editing, logical) {
+                        let resp = ui.interact(rect, ui.id().with(("tablegutter", l)), TABLE_CELL_SENSE);
+                        if resp.is_pointer_button_down_on() && primary_down && !gutter_dragging {
+                            gutter_press.set(Some(l));
+                        }
+                        if gutter_ptr_y.is_some_and(|y| gutter_row_hit(y, rect, spacing_y)) {
+                            gutter_head.set(Some(l));
+                        }
+                    }
                 });
                 let fields = logical
                     .and_then(|l| parse_logical_line_edit(doc, l, delim))
@@ -7775,8 +7969,9 @@ fn render_table(
                         }
 
                         // 선택 사각형 음영(컬럼 음영과 같은 색·같은 gapless 규칙).
-                        if let Some(sel) = cur_sel {
-                            if rect_contains(sel, lrow, c) {
+                        // Ctrl로 고른 행은 행 전체.
+                        if picked.contains(&lrow) || cur_sel.is_some_and(|s| rect_contains(s, lrow, c)) {
+                            {
                                 ui.painter().rect_filled(
                                     gapless_cell_rect(ui, cell_rect),
                                     0.0,
@@ -7933,6 +8128,7 @@ fn render_table(
         };
         doc.cell_sel = None;
         doc.cell_drag_active = false;
+        doc.picked_rows.clear();
     }
 
     // 필터 아이콘 클릭 → 드롭다운 토글. 같은 컬럼을 다시 누르면 닫고, 다른
@@ -8016,6 +8212,58 @@ fn render_table(
             doc.cell_sel = Some((sel.0, sel.1, hr, hc));
         }
     }
+    // 셀을 누르면 Ctrl로 고른 행은 풀린다.
+    if shift_click.get().is_some() || drag_anchor.get().is_some() {
+        doc.picked_rows.clear();
+    }
+
+    // 3-b) 줄 번호(`#`) 칸 — `render_text`의 2-d)와 같은 규칙. 행 선택은
+    //      그 행의 모든 컬럼을 덮는 사각형이다.
+    doc.gutter_drag_active = primary_down && (gutter_dragging || gutter_press.get().is_some());
+    {
+        let last_col = col_count.saturating_sub(1);
+        let made_by_gutter = doc
+            .gutter_sel
+            .is_some_and(|(a, h)| doc.cell_sel == Some((a, 0, h, last_col)));
+        let mut rows: Option<(usize, usize)> = None;
+        if let Some(row) = gutter_press.get() {
+            if shift_down {
+                rows = Some((
+                    gutter_shift_anchor(doc.gutter_sel, made_by_gutter, doc.cell_sel.map(|s| s.0), row),
+                    row,
+                ));
+            } else if ctrl_down {
+                let seed = doc.gutter_sel.filter(|_| made_by_gutter);
+                doc.picked_rows = toggle_picked_row(&doc.picked_rows, seed, row);
+                doc.gutter_sel = None;
+                doc.cell_sel = None;
+            } else {
+                rows = Some((row, row));
+            }
+        } else if gutter_dragging {
+            if let (Some((a, _)), Some(h)) = (doc.gutter_sel, gutter_head.get()) {
+                rows = Some((a, h));
+            }
+        }
+        if let Some((a, h)) = rows {
+            doc.gutter_sel = Some((a, h));
+            doc.picked_rows.clear();
+            doc.cell_sel = Some((a, 0, h, last_col));
+        }
+        // 드래그가 본문 위·아래로 나가면 세로로 민다(텍스트 모드 2-c)와 같은 양).
+        if doc.gutter_drag_active && doc.gutter_sel.is_some() {
+            if let Some(p) = ui.input(|i| i.pointer.latest_pos()) {
+                let dy = edge_autoscroll(p.y, body_top, body_bottom, row_h * 3.0);
+                if let (true, Some(id)) = (dy != 0.0, inner_scroll_id.get()) {
+                    let ctx = ui.ctx().clone();
+                    let mut st = egui::scroll_area::State::load(&ctx, id).unwrap_or_default();
+                    st.offset.y = (st.offset.y + dy).max(0.0);
+                    st.store(&ctx, id);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+    }
 
     // 4) 더블클릭 → 셀 편집 시작.
     if let Some((lrow, c, val)) = begin_edit.into_inner() {
@@ -8041,9 +8289,11 @@ fn render_table(
     // 사각 범위로 환산한다). 그래야 우클릭 메뉴에서도 컬럼 전체 복사가 된다.
     if let Some((lrow, c)) = menu_target.get() {
         let column_targeted = doc.cell_sel.is_none() && doc.selected_col == Some(c);
-        let inside = doc.cell_sel.map_or(false, |s| rect_contains(s, lrow, c));
+        let inside = doc.cell_sel.map_or(false, |s| rect_contains(s, lrow, c))
+            || doc.picked_rows.contains(&lrow);
         if !inside && !column_targeted {
             doc.cell_sel = Some((lrow, c, lrow, c));
+            doc.picked_rows.clear();
         }
     }
     if let Some(act) = menu_action.get() {
@@ -8169,6 +8419,9 @@ fn apply_cell_menu_action_confirmed(
     paste_text: Option<&str>,
     confirmed: bool,
 ) {
+    if apply_picked_cell_action(ui, doc, delim, clipboard, act) {
+        return;
+    }
     let data_start = if doc.has_header { 1 } else { 0 };
     let line_count = doc.edit.as_ref().map_or(0, |e| e.lines.len());
     let Some((r0, c0, r1, c1)) =
@@ -8319,6 +8572,68 @@ fn apply_cell_menu_action_confirmed(
         }
     }
 
+}
+
+/// Ctrl로 고른 행이 있을 때의 표 동작. 복사·잘라내기·지우기·행 삭제는 고른
+/// 행 전체(모든 컬럼)를 대상으로 하고 true를 돌려준다. 붙여넣기·행 삽입은
+/// 기준점 하나가 필요하므로 첫 고른 행을 행 선택으로 바꾸고 false를 돌려줘
+/// 평소 경로로 넘긴다. 고른 행은 손으로 하나씩 고른 것이라 "큰 연산 확인"은
+/// 묻지 않는다.
+fn apply_picked_cell_action(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    delim: u8,
+    clipboard: &mut String,
+    act: CellMenuAction,
+) -> bool {
+    let Some(&first) = doc.picked_rows.first() else { return false };
+    let last_col = table_col_count(doc, delim).saturating_sub(1);
+    let picked = std::mem::take(&mut doc.picked_rows);
+    let Some(e) = doc.edit.as_mut() else { return false };
+    let rows: Vec<usize> = picked.iter().copied().filter(|&r| r < e.lines.len()).collect();
+    let copy_rows = |lines: &[String]| -> String {
+        rows.iter()
+            .map(|&r| crate::edit::cells_to_tsv(lines, r, 0, r, last_col, delim))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    match act {
+        CellMenuAction::Copy => {
+            let tsv = copy_rows(&e.lines);
+            *clipboard = tsv.clone();
+            ui.output_mut(|o| o.copied_text = tsv);
+            // 복사는 선택을 바꾸지 않는다.
+            doc.picked_rows = picked;
+        }
+        CellMenuAction::Cut | CellMenuAction::Clear => {
+            if act == CellMenuAction::Cut {
+                let tsv = copy_rows(&e.lines);
+                *clipboard = tsv.clone();
+                ui.output_mut(|o| o.copied_text = tsv);
+            }
+            let before = crate::edit::EditOp::Replace(rows.iter().map(|&r| (r, e.lines[r].clone())).collect());
+            for &r in &rows {
+                crate::edit::clear_cells(&mut e.lines, r, 0, r, last_col, delim);
+            }
+            if edit_op_differs_from_current(&before, &e.lines) {
+                e.undo.push(before);
+                e.dirty = true;
+            }
+            doc.picked_rows = picked;
+        }
+        CellMenuAction::DeleteRows => {
+            if let Some(first) = delete_picked_rows(e, &picked) {
+                let r = first.min(e.lines.len().saturating_sub(1));
+                doc.cell_sel = Some((r, 0, r, last_col));
+            }
+            doc.editing_cell = None;
+        }
+        CellMenuAction::Paste | CellMenuAction::InsertRowAbove | CellMenuAction::InsertRowBelow => {
+            doc.cell_sel = Some((first, 0, first, last_col));
+            return false;
+        }
+    }
+    true
 }
 
 /// 텍스트 모드 우클릭 컨텍스트 메뉴 동작. `CellMenuAction`과 같은 이유로
@@ -8766,6 +9081,13 @@ fn render_text(
     let caret = doc.text_caret;
     // IME 조합 중 글자. 버퍼에 없으므로 여기서 스냅샷해 캐럿 자리에 덧그린다.
     let ime_preview = doc.ime_preview.clone();
+    // Ctrl로 고른 행은 다른 선택이 생기면(찾기·전체 선택·Shift+화살표 등
+    // 어디서 만들었든) 그 선택에 자리를 내준다. 고를 때 `text_sel`을 비워
+    // 두므로 둘이 같이 있으면 고른 뒤에 다른 선택이 생긴 것이다.
+    if doc.text_sel.is_some() {
+        doc.picked_rows.clear();
+    }
+    let picked = doc.picked_rows.clone();
     // 정규화한 선택(음영 그리기용).
     let sel_norm = doc
         .text_sel
@@ -8810,6 +9132,12 @@ fn render_text(
     // (`next_cell_drag_active`와 같은 전이 규칙을 그대로 쓴다 — 표/텍스트 모드가
     // 다른 것은 무엇을 눌렀는지뿐이고, 래치 논리는 동일하다.)
     let drag_active = doc.text_drag_active && primary_down;
+    // 줄 번호(`#`) 칸 상호작용. 누름이 시작된 줄과, 드래그 중 포인터 높이가
+    // 든 줄을 모은다. 적용은 클로저 밖 2-d)에서 한다.
+    let ctrl_down = ui.input(|i| i.modifiers.ctrl);
+    let gutter_dragging = doc.gutter_drag_active && primary_down;
+    let gutter_press: Cell<Option<usize>> = Cell::new(None);
+    let gutter_head: Cell<Option<usize>> = Cell::new(None);
 
     // 키 입력은 프레임당 한 번만 읽는다. 편집 모드 + 다른 위젯이 키보드 포커스를
     // 갖고 있지 않을 때만 소비한다 — 그렇지 않으면 툴바의 "직접:" 구분자
@@ -8870,6 +9198,7 @@ fn render_text(
     // 본문(헤더 아래) 세로 범위 — 드래그 자동 스크롤 판정과 포인터 클램프에 쓴다.
     let body_top = table_rect.top() + row_h + spacing_y;
     let body_bottom = table_rect.bottom();
+    let gutter_ptr_y = gutter_pointer_y(ui, gutter_dragging, body_top, body_bottom);
     // 줄 끝 뒤 여유: 개행 표식(`\r\n` 글리프)과 캐럿이 들어갈 자리.
     let line_pad = font_id.size * 3.0;
     // 키 입력으로 캐럿이 움직였으면(지난 프레임) 캐럿이 보이게 가로 offset을
@@ -8948,11 +9277,28 @@ fn render_text(
                     min_drawn_row.get().map_or(logical, |m: usize| m.min(logical)),
                 ));
                 let line_no = logical + row_base;
+                let line = logical_line(doc, logical).unwrap_or_default();
                 row.col(|ui| {
                     let rect = ui.max_rect();
-                    paint_line_number_cell(ui, rect, format!("{line_no}"));
+                    // 선택이 걸친 줄(고른 줄 포함)은 번호 칸도 칠한다.
+                    let selected = picked.contains(&logical)
+                        || sel_norm.is_some_and(|(a, b)| {
+                            sel_span_on_line(a, b, logical, line_char_len(&line)).is_some()
+                        });
+                    paint_line_number_cell(ui, rect, format!("{line_no}"), selected);
+                    // 클릭 → 그 줄 전체(개행까지), 드래그 → 여러 줄, Shift+클릭 →
+                    // 앵커 줄부터 여기까지, Ctrl+클릭 → 한 줄씩 담기/빼기.
+                    // 누름은 드래그가 이어지는 동안 다시 잡지 않는다(앵커 유지).
+                    if editing {
+                        let resp = ui.interact(rect, ui.id().with(("textgutter", logical)), TEXT_LINE_SENSE);
+                        if resp.is_pointer_button_down_on() && primary_down && !gutter_dragging {
+                            gutter_press.set(Some(logical));
+                        }
+                        if gutter_ptr_y.is_some_and(|y| gutter_row_hit(y, rect, spacing_y)) {
+                            gutter_head.set(Some(logical));
+                        }
+                    }
                 });
-                let line = logical_line(doc, logical).unwrap_or_default();
                 row.col(|ui| {
                     text_col_rect.set(Some(ui.max_rect()));
                     // ---- 뷰 전용 모드 ----
@@ -9067,9 +9413,15 @@ fn render_text(
                     // 0) 탭 칸 배경을 가장 아래에. 선택·매치가 그 위에 겹치면
                     //    그쪽이 이겨야 한다(지금 무엇을 하고 있는지가 우선).
                     paint_tab_shades(&painter, cell_rect, &x_of, &tab_positions(&line));
-                    // 1) 선택 음영을 글자 아래에 먼저.
-                    if let Some((a, b)) = sel_norm {
-                        if let Some((c0, c1)) = sel_span_on_line(a, b, logical, len) {
+                    // 1) 선택 음영을 글자 아래에 먼저. Ctrl로 고른 줄은 줄 전체 +
+                    //    개행 한 칸(`#` 클릭 선택과 같은 모양).
+                    let span = if picked.contains(&logical) {
+                        Some((0, len + 1))
+                    } else {
+                        sel_norm.and_then(|(a, b)| sel_span_on_line(a, b, logical, len))
+                    };
+                    {
+                        if let Some((c0, c1)) = span {
                             // c1이 len+1이면(개행 포함) 줄 끝 너머 한 칸을 더 칠한다.
                             let x0 = x_of(c0);
                             let x1 = if c1 > len {
@@ -9364,14 +9716,59 @@ fn render_text(
         doc.text_caret = b;
         doc.text_sel = if a == b { None } else { Some((a, b)) };
     }
+    // 본문을 클릭하면 Ctrl로 고른 줄은 풀린다(새 캐럿·선택이 생겼다).
+    if shift_click.get().is_some() || drag_anchor.get().is_some() || multi_click.get().is_some() {
+        doc.picked_rows.clear();
+    }
+
+    // 2-d) 줄 번호(`#`) 칸. 클릭 → 한 줄, 드래그 → 여러 줄, Shift+클릭 → 앵커
+    //      줄부터, Ctrl+클릭 → 한 줄씩 담기/빼기. 앵커는 `gutter_sel`에 남겨 다음
+    //      Shift+클릭이 이어받는다. Ctrl 누름도 드래그 래치를 켠다 — 안 켜면
+    //      버튼을 누르고 있는 다음 프레임에 같은 줄을 또 눌린 것으로 보고 뺐다
+    //      넣기를 되풀이한다. 대신 `gutter_sel`을 비워 끌어도 넓어지지 않는다.
+    doc.gutter_drag_active = primary_down && (gutter_dragging || gutter_press.get().is_some());
+    if let Some(e) = doc.edit.as_ref() {
+        let made_by_gutter = doc
+            .gutter_sel
+            .is_some_and(|(a, h)| doc.text_sel == Some(gutter_text_sel(a, h, &e.lines)));
+        let mut rows: Option<(usize, usize)> = None;
+        if let Some(row) = gutter_press.get() {
+            if shift_down {
+                let sel_anchor = doc.text_sel.map_or(doc.text_caret.line, |(a, _)| a.line);
+                rows = Some((gutter_shift_anchor(doc.gutter_sel, made_by_gutter, Some(sel_anchor), row), row));
+            } else if ctrl_down {
+                let seed = doc.gutter_sel.filter(|_| made_by_gutter);
+                doc.picked_rows = toggle_picked_row(&doc.picked_rows, seed, row);
+                doc.gutter_sel = None;
+                doc.text_sel = None;
+                doc.text_caret = crate::edit::TextPos { line: row, col: 0 };
+            } else {
+                rows = Some((row, row));
+            }
+        } else if gutter_dragging {
+            if let (Some((a, _)), Some(h)) = (doc.gutter_sel, gutter_head.get()) {
+                rows = Some((a, h));
+            }
+        }
+        if let Some((a, h)) = rows {
+            let (s, t) = gutter_text_sel(a, h, &e.lines);
+            doc.gutter_sel = Some((a, h));
+            doc.picked_rows.clear();
+            doc.text_caret = t;
+            doc.text_sel = if s == t { None } else { Some((s, t)) };
+        }
+    }
+    let gutter_extending = doc.gutter_drag_active && doc.gutter_sel.is_some();
 
     // 2-c) 드래그 자동 스크롤. 선택하며 포인터를 본문 밖으로 끌면 그쪽으로
     //      화면을 민다(가로: `TextHScroll::offset`, 세로: 표 안쪽 ScrollArea).
     //      포인터가 멈춰 있어도 계속 굴러가야 하므로 다시 그리기를 요청한다.
-    if drag_active {
+    //      `#` 칸 드래그는 세로만 민다(포인터가 텍스트 열 왼쪽에 있으므로
+    //      가로까지 보면 계속 왼쪽으로 굴러간다).
+    if drag_active || gutter_extending {
         if let (Some(p), Some(col)) = (ui.input(|i| i.pointer.latest_pos()), text_col_rect.get()) {
             let step = row_h * 3.0;
-            let dx = edge_autoscroll(p.x, col.left(), col.right(), step * 2.0);
+            let dx = if drag_active { edge_autoscroll(p.x, col.left(), col.right(), step * 2.0) } else { 0.0 };
             let dy = edge_autoscroll(p.y, body_top, body_bottom, step);
             if dx != 0.0 {
                 let hs = &mut doc.text_hscroll;
@@ -9398,7 +9795,9 @@ fn render_text(
     // 화면이 따라가면 안 되는 경우다.
     let caret_before_keys = doc.text_caret;
     for intent in intents {
-        apply_text_intent(ui, doc, clipboard, intent);
+        if !apply_picked_text_intent(ui, doc, clipboard, &intent) {
+            apply_text_intent(ui, doc, clipboard, intent);
+        }
     }
     if doc.text_caret != caret_before_keys {
         doc.text_hscroll.follow_caret = true;
@@ -9417,9 +9816,10 @@ fn render_text(
             .filter(|(a, b)| a != b);
         let inside = cur_sel.map_or(false, |(a, b)| {
             (a.line..=b.line).contains(&t.line)
-        });
+        }) || doc.picked_rows.contains(&t.line);
         if !inside {
             doc.text_sel = None;
+            doc.picked_rows.clear();
             if let Some(e) = &doc.edit {
                 doc.text_caret = clamp_pos(&e.lines, t);
             }
@@ -9433,7 +9833,9 @@ fn render_text(
             TextMenuAction::Delete => TextEditIntent::Delete,
             TextMenuAction::SelectAll => TextEditIntent::SelectAll,
         };
-        apply_text_intent(ui, doc, clipboard, intent);
+        if !apply_picked_text_intent(ui, doc, clipboard, &intent) {
+            apply_text_intent(ui, doc, clipboard, intent);
+        }
     }
 
     // 5) 프레임 마무리: 캐럿/선택을 현재 버퍼 범위로 클램프해 다음 프레임 렌더와
@@ -9445,6 +9847,47 @@ fn render_text(
             .map(|(a, b)| (clamp_pos(&e.lines, a), clamp_pos(&e.lines, b)))
             .filter(|(a, b)| a != b);
     }
+}
+
+/// Ctrl로 고른 줄이 있을 때의 키·메뉴 동작. 복사·잘라내기·삭제(Delete,
+/// Backspace)는 고른 줄 전체를 대상으로 하고 true를 돌려준다. 그 밖의 동작은
+/// 고른 줄을 풀고 false를 돌려줘 평소 경로(`apply_text_intent`)로 넘긴다 —
+/// 떨어진 줄 여러 곳에 동시에 타이핑하는 기능은 없다.
+fn apply_picked_text_intent(
+    ui: &mut egui::Ui,
+    doc: &mut Document,
+    clipboard: &mut String,
+    intent: &TextEditIntent,
+) -> bool {
+    if doc.picked_rows.is_empty() {
+        return false;
+    }
+    // IME 미리보기는 버퍼를 건드리지 않으니 고른 줄을 풀 이유가 없다.
+    if matches!(intent, TextEditIntent::ImePreview(_)) {
+        return false;
+    }
+    let Some(e) = doc.edit.as_mut() else { return false };
+    match intent {
+        TextEditIntent::Copy | TextEditIntent::Cut => {
+            let s = picked_rows_text(&e.lines, &doc.picked_rows);
+            *clipboard = s.clone();
+            ui.output_mut(|o| o.copied_text = s);
+            if matches!(intent, TextEditIntent::Copy) {
+                return true;
+            }
+        }
+        TextEditIntent::Delete | TextEditIntent::Backspace => {}
+        _ => {
+            doc.picked_rows.clear();
+            return false;
+        }
+    }
+    if let Some(first) = delete_picked_rows(e, &doc.picked_rows) {
+        doc.text_caret = clamp_pos(&e.lines, crate::edit::TextPos { line: first, col: 0 });
+    }
+    doc.text_sel = None;
+    doc.picked_rows.clear();
+    true
 }
 
 /// 헥스 문서의 논리 길이. 편집 중이면 버퍼(삽입/삭제로 소스와 다르다).
@@ -18857,6 +19300,277 @@ mod tests {
             doc.visible_rows
         );
         frame(&mut app, &ctx, vec![btn(below, false)]);
+    }
+
+    // ---- `#` 칸 행 선택(클릭·드래그·Shift·Ctrl) ----
+
+    /// `#` 칸 테스트 하네스. 텍스트(`table == false`) 또는 표 렌더를 800×600
+    /// 창에서 한 프레임 돌린다.
+    fn gutter_frame(app: &mut App, ctx: &egui::Context, table: bool, events: Vec<egui::Event>, clip: &mut String) {
+        gutter_frame_mod(app, ctx, table, events, egui::Modifiers::NONE, clip);
+    }
+
+    /// 수정 키를 누른 채인 프레임. egui는 Shift/Ctrl 상태를 이벤트가 아니라
+    /// `RawInput::modifiers`에서 읽는다(실제 앱에선 winit이 채운다).
+    fn gutter_frame_mod(
+        app: &mut App,
+        ctx: &egui::Context,
+        table: bool,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+        clip: &mut String,
+    ) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let input = egui::RawInput { screen_rect: Some(screen), events, modifiers, ..Default::default() };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let doc = app.doc_mut().unwrap();
+                if table {
+                    render_table(ui, doc, b',', 1, 0, clip);
+                } else {
+                    render_text(ui, doc, 1, clip, false, crate::i18n::Lang::En);
+                }
+            });
+        });
+    }
+
+    /// 화면 i번째 본문 행의 `#` 칸 가운데 좌표. 헤더 한 줄 아래부터 행 높이 +
+    /// 행 간격씩 내려간다(CentralPanel 여백 8px).
+    fn gutter_pos(app: &App, ctx: &egui::Context, i: usize) -> egui::Pos2 {
+        let row_h = doc_row_height(app.doc().unwrap());
+        let gap = ctx.style().spacing.item_spacing.y;
+        let top = 8.0 + row_h + gap;
+        egui::pos2(30.0, top + i as f32 * (row_h + gap) + row_h * 0.5)
+    }
+
+    fn gutter_btn(pos: egui::Pos2, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers }
+    }
+
+    /// 누르고 → (옮기고) → 뗀다. 각 단계가 한 프레임이다.
+    fn gutter_click(
+        app: &mut App,
+        ctx: &egui::Context,
+        table: bool,
+        from: usize,
+        to: usize,
+        modifiers: egui::Modifiers,
+        clip: &mut String,
+    ) {
+        let a = gutter_pos(app, ctx, from);
+        let b = gutter_pos(app, ctx, to);
+        let m = modifiers;
+        gutter_frame_mod(app, ctx, table, vec![egui::Event::PointerMoved(a), gutter_btn(a, true, m)], m, clip);
+        if from != to {
+            gutter_frame_mod(app, ctx, table, vec![egui::Event::PointerMoved(b)], m, clip);
+            gutter_frame_mod(app, ctx, table, vec![], m, clip);
+        }
+        gutter_frame_mod(app, ctx, table, vec![gutter_btn(b, false, m)], m, clip);
+        gutter_frame(app, ctx, table, vec![], clip);
+    }
+
+    #[test]
+    fn gutter_text_sel_covers_newline_and_flips_upward() {
+        let lines = v(&["aa", "bbb", "c"]);
+        assert_eq!(gutter_text_sel(0, 0, &lines), (tp(0, 0), tp(1, 0)), "한 줄은 개행까지");
+        assert_eq!(gutter_text_sel(0, 1, &lines), (tp(0, 0), tp(2, 0)));
+        assert_eq!(gutter_text_sel(2, 2, &lines), (tp(2, 0), tp(2, 1)), "마지막 줄은 줄 끝까지");
+        // 위로 끌면 앵커가 아래 줄 끝, 캐럿이 위 줄 첫 칸.
+        assert_eq!(gutter_text_sel(1, 0, &lines), (tp(2, 0), tp(0, 0)));
+        // 범위 밖 행은 마지막 줄로 접힌다(되돌리기로 줄이 줄어든 뒤 등).
+        assert_eq!(gutter_text_sel(9, 9, &lines), (tp(2, 0), tp(2, 1)));
+    }
+
+    #[test]
+    fn toggle_picked_row_seeds_from_row_selection_then_toggles() {
+        let empty = std::collections::BTreeSet::new();
+        // 드래그로 고른 1..=3에 Ctrl+클릭 6 → {1,2,3,6}. 위로 끈 (3,1)도 같다.
+        let s = toggle_picked_row(&empty, Some((3, 1)), 6);
+        assert_eq!(s.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 6]);
+        // 이미 있는 행은 뺀다. 씨앗은 비어 있을 때만 쓴다.
+        let s = toggle_picked_row(&s, Some((8, 9)), 2);
+        assert_eq!(s.iter().copied().collect::<Vec<_>>(), vec![1, 3, 6]);
+        // 씨앗 구간 안의 행을 Ctrl+클릭하면 그 행만 빠진다.
+        let s = toggle_picked_row(&empty, Some((0, 2)), 1);
+        assert_eq!(s.iter().copied().collect::<Vec<_>>(), vec![0, 2]);
+    }
+
+    #[test]
+    fn gutter_shift_anchor_prefers_gutter_anchor_only_when_unchanged() {
+        assert_eq!(gutter_shift_anchor(Some((4, 6)), true, Some(9), 1), 4);
+        assert_eq!(gutter_shift_anchor(Some((4, 6)), false, Some(9), 1), 9, "다른 선택으로 바뀌었으면 그 앵커");
+        assert_eq!(gutter_shift_anchor(None, false, None, 1), 1);
+    }
+
+    /// 떨어진 행 여러 개를 지우고 Ctrl+Z 한 번에 원래대로 돌아와야 한다.
+    /// 전부 지우는 경우(유령 빈 줄)도 같다.
+    #[test]
+    fn delete_picked_rows_undoes_in_one_step() {
+        let (mut app, _d) = edit_doc(b"r0\nr1\nr2\nr3\nr4\nr5\nr6", false);
+        let doc = app.doc_mut().unwrap();
+        let orig = doc.edit.as_ref().unwrap().lines.clone();
+        let picked: std::collections::BTreeSet<usize> = [1, 2, 4, 6].into_iter().collect();
+        let first = delete_picked_rows(doc.edit.as_mut().unwrap(), &picked);
+        assert_eq!(first, Some(1));
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["r0", "r3", "r5"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig, "한 번에 되돌아와야 한다");
+
+        let all: std::collections::BTreeSet<usize> = (0..orig.len()).collect();
+        delete_picked_rows(doc.edit.as_mut().unwrap(), &all);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&[""]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines, orig, "전부 지운 뒤에도 줄이 늘지 않고 돌아와야 한다");
+    }
+
+    /// 텍스트 모드: 드래그(아래·위), Shift+클릭, Ctrl+클릭 → 복사·삭제·되돌리기.
+    #[test]
+    fn text_gutter_drag_shift_and_ctrl_pick() {
+        let (mut app, _d) = edit_doc(b"l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7", false);
+        let ctx = egui::Context::default();
+        let mut clip = String::new();
+        let none = egui::Modifiers::NONE;
+        gutter_frame(&mut app, &ctx, false, vec![], &mut clip);
+        gutter_frame(&mut app, &ctx, false, vec![], &mut clip);
+
+        // 아래로 드래그: 1..=3 줄이 개행까지.
+        gutter_click(&mut app, &ctx, false, 1, 3, none, &mut clip);
+        assert_eq!(app.doc().unwrap().text_sel, Some((tp(1, 0), tp(4, 0))));
+        // 위로 드래그: 앵커는 3번 줄 끝(다음 줄 첫 칸), 캐럿은 1번 줄 첫 칸.
+        gutter_click(&mut app, &ctx, false, 3, 1, none, &mut clip);
+        assert_eq!(app.doc().unwrap().text_sel, Some((tp(4, 0), tp(1, 0))));
+
+        // Shift+클릭은 앵커 줄을 이어받는다.
+        gutter_click(&mut app, &ctx, false, 2, 2, none, &mut clip);
+        gutter_click(&mut app, &ctx, false, 5, 5, egui::Modifiers::SHIFT, &mut clip);
+        assert_eq!(app.doc().unwrap().text_sel, Some((tp(2, 0), tp(6, 0))));
+        gutter_click(&mut app, &ctx, false, 0, 0, egui::Modifiers::SHIFT, &mut clip);
+        assert_eq!(app.doc().unwrap().text_sel, Some((tp(3, 0), tp(0, 0))), "위로 넘어가도 앵커 줄(2)은 남는다");
+
+        // Ctrl+클릭: 한 줄 선택(1)에서 시작해 3, 6을 더하고 3을 뺀다.
+        gutter_click(&mut app, &ctx, false, 1, 1, none, &mut clip);
+        for r in [3, 6, 3] {
+            gutter_click(&mut app, &ctx, false, r, r, egui::Modifiers::CTRL, &mut clip);
+        }
+        let doc = app.doc().unwrap();
+        assert_eq!(doc.picked_rows.iter().copied().collect::<Vec<_>>(), vec![1, 6]);
+        assert_eq!(doc.text_sel, None, "고른 줄이 선택이다");
+
+        // 복사 → 고른 줄이 각각 개행과 함께.
+        gutter_frame(&mut app, &ctx, false, vec![egui::Event::Copy], &mut clip);
+        assert_eq!(clip, "l1\nl6\n");
+        // Delete → 두 줄이 지워지고, 되돌리기 한 번에 돌아온다.
+        let del = egui::Event::Key {
+            key: egui::Key::Delete,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: none,
+        };
+        gutter_frame(&mut app, &ctx, false, vec![del], &mut clip);
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["l0", "l2", "l3", "l4", "l5", "l7"]));
+        assert!(doc.picked_rows.is_empty());
+        undo_once(doc);
+        assert_eq!(
+            doc.edit.as_ref().unwrap().lines,
+            v(&["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"])
+        );
+    }
+
+    /// 표 모드: 클릭·드래그는 행 전체 사각형, Ctrl+클릭은 고른 행 → 복사·행 삭제.
+    #[test]
+    fn table_gutter_selects_rows_and_ctrl_picks() {
+        let (mut app, delim) = edit_doc(b"a0,b0,c0\na1,b1,c1\na2,b2,c2\na3,b3,c3\na4,b4,c4", false);
+        let ctx = egui::Context::default();
+        let mut clip = String::new();
+        let none = egui::Modifiers::NONE;
+        gutter_frame(&mut app, &ctx, true, vec![], &mut clip);
+        gutter_frame(&mut app, &ctx, true, vec![], &mut clip);
+
+        gutter_click(&mut app, &ctx, true, 1, 1, none, &mut clip);
+        assert_eq!(app.doc().unwrap().cell_sel, Some((1, 0, 1, 2)), "한 행 전체");
+        gutter_click(&mut app, &ctx, true, 1, 3, none, &mut clip);
+        assert_eq!(app.doc().unwrap().cell_sel, Some((1, 0, 3, 2)), "드래그로 여러 행");
+        gutter_click(&mut app, &ctx, true, 0, 0, egui::Modifiers::SHIFT, &mut clip);
+        assert_eq!(app.doc().unwrap().cell_sel, Some((1, 0, 0, 2)), "Shift는 앵커 행(1)을 잇는다");
+
+        gutter_click(&mut app, &ctx, true, 0, 0, none, &mut clip);
+        gutter_click(&mut app, &ctx, true, 3, 3, egui::Modifiers::CTRL, &mut clip);
+        let doc = app.doc().unwrap();
+        assert_eq!(doc.picked_rows.iter().copied().collect::<Vec<_>>(), vec![0, 3]);
+        assert_eq!(doc.cell_sel, None);
+
+        gutter_frame(&mut app, &ctx, true, vec![egui::Event::Copy], &mut clip);
+        assert_eq!(clip, "a0\tb0\tc0\na3\tb3\tc3");
+
+        // 행 삭제(우클릭 메뉴와 같은 경로) → 되돌리기 한 번.
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let doc = app.doc_mut().unwrap();
+                apply_cell_menu_action(ui, doc, delim, &mut clip, CellMenuAction::DeleteRows, None);
+            });
+        });
+        let doc = app.doc_mut().unwrap();
+        assert_eq!(doc.edit.as_ref().unwrap().lines, v(&["a1,b1,c1", "a2,b2,c2", "a4,b4,c4"]));
+        undo_once(doc);
+        assert_eq!(doc.edit.as_ref().unwrap().lines.len(), 5);
+        assert_eq!(doc.edit.as_ref().unwrap().lines[3], "a3,b3,c3");
+    }
+
+    /// 줄 번호 칸을 클릭하면 그 줄 전체가 개행까지(다음 줄 첫 칸까지) 선택되고,
+    /// 마지막 줄이면 개행이 없으므로 줄 끝까지 선택돼야 한다.
+    #[test]
+    fn text_line_number_click_selects_whole_line() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let frame = |app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let doc = app.doc_mut().unwrap();
+                    let mut clip = String::new();
+                    render_text(ui, doc, 1, &mut clip, false, crate::i18n::Lang::En);
+                });
+            });
+        };
+        let click = |app: &mut App, ctx: &egui::Context, pos: egui::Pos2| {
+            let btn = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            frame(app, ctx, vec![egui::Event::PointerMoved(pos), btn(true)]);
+            frame(app, ctx, vec![btn(false)]);
+            frame(app, ctx, vec![]);
+        };
+        let gutter = egui::pos2(30.0, 80.0);
+
+        // 가운데 줄: 다음 줄 첫 칸까지.
+        let (mut app, _d) = edit_doc(b"alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\n", false);
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, gutter);
+        let doc = app.doc().unwrap();
+        let (a, b) = doc.text_sel.expect("줄 번호 클릭으로 선택이 생겨야 한다");
+        assert_eq!(a.col, 0);
+        assert_eq!((b.line, b.col), (a.line + 1, 0), "개행까지 선택: 다음 줄 첫 칸");
+        assert_eq!(doc.text_caret, b);
+        let l = a.line;
+        assert!(l > 0 && l < 5, "클릭 y가 가운데 줄에 떨어져야 테스트가 의미 있다, got {l}");
+
+        // 같은 자리가 마지막 줄이면(뒤에 개행 없음) 줄 끝까지.
+        let mut content = (0..l).map(|i| format!("line{i}\n")).collect::<String>();
+        content.push_str("tail");
+        let (mut app, _d) = edit_doc(content.as_bytes(), false);
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        click(&mut app, &ctx, gutter);
+        let (a, b) = app.doc().unwrap().text_sel.expect("마지막 줄도 선택돼야 한다");
+        assert_eq!((a.line, a.col), (l, 0));
+        assert_eq!((b.line, b.col), (l, 4));
     }
 
     /// 텍스트 모드 편집 문서에서 창보다 긴 줄에 End를 누르면 가로 offset이
